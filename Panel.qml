@@ -30,7 +30,11 @@ Panel {
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property color hoverFill: bar ? Style.hoverFillFor(bar.foreground, Commons.Color.accent) : "transparent"
   readonly property color selectedFill: bar ? Style.selectedFillFor(bar.foreground, Commons.Color.accent) : "transparent"
-  readonly property color barIconColor: mullvad.problem ? root.urgent : (mullvad.active ? barForeground : Qt.darker(barForeground, 1.55))
+  // Dimming is the bar's only on/off signal, so it applies to problem states
+  // too. It fades rather than darkens: darkening reads as bolder on a light
+  // theme.
+  readonly property color barIconTone: mullvad.problem ? root.urgent : barForeground
+  readonly property color barIconColor: mullvad.active ? barIconTone : Util.alpha(barIconTone, 0.5)
 
   readonly property bool showLogin: mullvad.daemonRunning && mullvad.accountKnown && !mullvad.loggedIn
   readonly property bool showConnected: mullvad.daemonRunning && mullvad.loggedIn
@@ -294,8 +298,6 @@ Panel {
           iconSize: Style.space(13)
           color: root.barIconColor
           badgeColor: root.urgent
-          fontFamily: root.fontFamily
-          crossed: mullvad.daemonRunning && !mullvad.active
           warning: !mullvad.daemonRunning || (mullvad.accountKnown && !mullvad.loggedIn) || mullvad.problem
           pulsing: mullvad.transitioning
         }
@@ -385,8 +387,6 @@ Panel {
                   iconSize: Style.font.display
                   color: mullvad.problem ? root.urgent : root.foreground
                   badgeColor: root.urgent
-                  fontFamily: root.fontFamily
-                  crossed: mullvad.daemonRunning && !mullvad.active
                   warning: mullvad.problem
                   pulsing: mullvad.transitioning
                 }

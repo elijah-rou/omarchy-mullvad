@@ -9,7 +9,7 @@ Standalone MIT-licensed Omarchy shell bar widget for Mullvad VPN, installed as p
 - `Panel.qml`: bar icon, panel UI, keyboard cursor, and IPC target `elijahrou.mullvad`.
 - `Service.qml`: every `mullvad` CLI call, the `status --json listen` stream, and the `/etc/mullvad-vpn/settings.json` watch.
 - `Model.js`: pure parsers and view-model helpers with no Qt dependency, tested under node by `tests/model.test.js`.
-- `MullvadIcon.qml`: bar and hero glyph.
+- `MullvadIcon.qml`: bar and hero icon, the Mullvad mark drawn natively as a `Shape` in the theme color, as the stock Tailscale and Dropbox icons draw theirs.
 
 ## Validate
 
