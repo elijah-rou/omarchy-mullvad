@@ -460,7 +460,7 @@ def bar_layer(rec):
 
 def cmd_launch(args):
     checkout, host_socket = launch_inputs(args)
-    return start_run(new_record(checkout, args.evidence_root), host_socket)
+    return 0 if start_run(new_record(checkout, args.evidence_root), host_socket) is None else 1
 
 
 def launch_inputs(args):
@@ -482,8 +482,10 @@ def launch_inputs(args):
 
 
 def start_run(rec, host_socket):
-    """Starts the run rec names; returns launch's exit code. The record exists
-    before this starts anything, so a caller holding it can always clean up."""
+    """Starts the run rec names; returns None once it is ready, or why launch
+    failed, which launch.json also keeps so a verdict can name it. The record
+    exists before this starts anything, so a caller holding it can always
+    clean up."""
     assert os.path.exists(record_path(rec["id"]))
     try:
         make_run_dirs(rec)
@@ -492,14 +494,23 @@ def start_run(rec, host_socket):
         start_shell(rec, host_qs_ids())
         status = wait_ready(rec)
     except Failure as error:
+        failure = " ".join(str(error).split())
+        assert failure
+        write_launch_evidence(rec, None, failure)
         print(f"FAIL launch: {error}")
         print(f"logs: {rec['dir']}/logs; clean up with `{SKILL} cleanup --run {rec['id']}`")
-        return 1
-    write_evidence(rec, "launch.json", {"run": rec["id"], "checkout": rec["checkout"], "revision": rec["revision"],
-                                        "status": status, "time": datetime.datetime.now().isoformat()})
+        return failure
+    write_launch_evidence(rec, status, None)
     print(f"ready run={rec['id']} status={status!r}")
     print(f"evidence={rec['evidence']}")
-    return 0
+    return None
+
+
+def write_launch_evidence(rec, status, failure):
+    assert (status is None) != (failure is None)
+    write_evidence(rec, "launch.json", {"run": rec["id"], "checkout": rec["checkout"], "revision": rec["revision"],
+                                        "status": status, "failure": failure,
+                                        "time": datetime.datetime.now().isoformat()})
 
 
 def new_record(checkout, evidence_root):
@@ -1743,12 +1754,19 @@ def cmd_all(args):
     # another shell's run that happens to be newer.
     rec = new_record(checkout, args.evidence_root)
     not_driven = None
+    # The summary names why nothing was driven, so a verdict that compares
+    # this run with main's can name the launch or doctor failure.
+    not_driven_why = None
     try:
-        if start_run(rec, host_socket) != 0:
+        launch_failure = start_run(rec, host_socket)
+        if launch_failure is not None:
             not_driven = "launch failed"
+            not_driven_why = f"launch failed: {launch_failure}"
         elif cmd_doctor(argparse.Namespace(run=rec["id"], strict_toolchain=args.strict_toolchain,
                                            checkout=None, toolchain_only=False)) != 0:
             not_driven = "doctor failed"
+            not_driven_why = "doctor failed: doctor-*.json names the failed checks"
+        assert (not_driven is None) == (not_driven_why is None)
         for feature in FEATURES:
             if not_driven:
                 # Nothing was driven, so no feature passed or failed.
@@ -1761,7 +1779,7 @@ def cmd_all(args):
     finally:
         cleaned = cleanup_run(rec) == 0
     summary = (f"all: {counts['PASS']} passed, {counts['FAIL']} failed, {counts['SKIP']} skipped"
-               + (f"; not driven: {not_driven}" if not_driven else "")
+               + (f"; not driven: {not_driven_why}" if not_driven else "")
                + ("" if cleaned else "; cleanup FAILED"))
     append_result(rec, summary)
     print(summary)
@@ -1888,7 +1906,9 @@ EXAMPLES = {
               "--evidence-root /tmp/evidence",
     "doctor": f"verify-omarchy-mullvad doctor {EXAMPLE_RUN}\n  verify-omarchy-mullvad doctor {EXAMPLE_RUN} --strict-toolchain\n"
               "  verify-omarchy-mullvad doctor --toolchain-only --checkout /tmp/copy",
-    "drive": f"verify-omarchy-mullvad drive bar-icon {EXAMPLE_RUN}\n  verify-omarchy-mullvad drive account {EXAMPLE_RUN} --repeat 3",
+    "drive": f"verify-omarchy-mullvad drive bar-icon {EXAMPLE_RUN}\n  verify-omarchy-mullvad drive connection {EXAMPLE_RUN}\n"
+             f"  verify-omarchy-mullvad drive location {EXAMPLE_RUN}\n  verify-omarchy-mullvad drive settings {EXAMPLE_RUN}\n"
+             f"  verify-omarchy-mullvad drive account {EXAMPLE_RUN} --repeat 3",
     "all": "verify-omarchy-mullvad all --checkout ~/Projects/omarchy-mullvad --allow-host-window",
     "cleanup": f"verify-omarchy-mullvad cleanup {EXAMPLE_RUN}",
     "test": "verify-omarchy-mullvad test --checkout ~/Projects/omarchy-mullvad",
