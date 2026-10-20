@@ -575,9 +575,16 @@ Panel {
                 text: root.locationQuery
                 onTextChanged: root.locationQuery = text
                 onActiveFocusChanged: if (activeFocus) root.setCursor("search")
-                onAccepted: root.activate("search")
+                // Return is taken here, not in onAccepted: TextInput passes it
+                // on after accepting, and the pick has already moved focus to
+                // the key catcher, which would then reopen the picker on the
+                // Location row. A held Return never picks, since a pick can
+                // connect.
                 Keys.onPressed: function(event) {
-                  if (event.key === Qt.Key_Down || event.key === Qt.Key_Tab) {
+                  if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                    if (!event.isAutoRepeat) root.activate("search")
+                    event.accepted = true
+                  } else if (event.key === Qt.Key_Down || event.key === Qt.Key_Tab) {
                     root.leaveField(1)
                     event.accepted = true
                   } else if (event.key === Qt.Key_Up) {
