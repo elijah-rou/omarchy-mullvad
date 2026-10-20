@@ -1,0 +1,59 @@
+{
+  "relay_settings": {
+    "normal": {
+      "location": {
+        "only": {
+          "location": {
+            "country": "se",
+            "city": "got"
+          }
+        }
+      },
+      "providers": "any",
+      "ownership": "any",
+      "wireguard_constraints": {
+        "ip_version": "any",
+        "allowed_ips": "any",
+        "use_multihop": false,
+        "entry_location": {
+          "only": {
+            "location": {
+              "country": "se"
+            }
+          }
+        }
+      }
+    }
+  },
+  "allow_lan": true,
+  "lockdown_mode": false,
+  "auto_connect": false,
+  "tunnel_options": {
+    "wireguard": {
+      "mtu": null,
+      "quantum_resistant": "on",
+      "daita": {
+        "enabled": false,
+        "use_multihop_if_necessary": true
+      }
+    },
+    "generic": {
+      "enable_ipv6": false
+    },
+    "dns_options": {
+      "state": "default",
+      "default_options": {
+        "block_ads": true,
+        "block_trackers": false,
+        "block_malware": false,
+        "block_adult_content": false,
+        "block_gambling": false,
+        "block_social_media": false
+      },
+      "custom_options": {
+        "addresses": []
+      }
+    }
+  },
+  "settings_version": 17
+}

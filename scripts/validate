@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$root"
+
+omarchy plugin validate .
+node tests/model.test.js
+
+# qmllint fails on syntax and type errors. Its unqualified-access warnings
+# come from the Omarchy shell's own module layout and are not failures here.
+qmllint=$(command -v qmllint || echo /usr/lib/qt6/bin/qmllint)
+for file in Panel.qml Service.qml MullvadIcon.qml; do
+  "$qmllint" -I /usr/share/omarchy/shell -I /usr/lib/qt6/qml "$file" 2>/dev/null
+done
+if "$qmllint" -I /usr/share/omarchy/shell -I /usr/lib/qt6/qml Service.qml 2>&1 | grep -q 'property-override'; then
+  printf 'Service.qml shadows a base Item property\n' >&2
+  exit 1
+fi
+
+# The account number reaches mullvad over stdin, never argv.
+if grep -nE '"account", "login", ' Service.qml; then
+  printf 'account number passed as an argument\n' >&2
+  exit 1
+fi
+
+if command -v shellcheck >/dev/null 2>&1; then shellcheck scripts/validate; fi
+test -x scripts/validate
+printf 'validation passed\n'
