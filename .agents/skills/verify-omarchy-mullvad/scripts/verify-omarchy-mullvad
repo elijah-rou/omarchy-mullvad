@@ -59,7 +59,8 @@ hl.config({
   misc = { disable_hyprland_logo = true, disable_splash_rendering = true, disable_watchdog_warning = true },
   animations = { enabled = false },
   xwayland = { enabled = false },
-  input = { kb_layout = "us" },
+  -- Held-key checks rely on clients autorepeating at this rate and delay.
+  input = { kb_layout = "us", repeat_rate = 25, repeat_delay = 600 },
 })
 """
 
@@ -696,6 +697,14 @@ def keys(rec, *names, text=None):
     time.sleep(0.25)
 
 
+def hold(rec, name, ms):
+    """Holds one key down for ms milliseconds, so the focused client
+    autorepeats it (the compositor's repeat_delay is 600 ms, its rate 25/s)."""
+    assert 0 < ms <= 5000
+    run_client(rec, ["wtype", "-P", name, "-s", str(ms), "-p", name], timeout_s=10 + ms // 1000)
+    time.sleep(0.25)
+
+
 class Wire:
     """Just enough of the Wayland wire protocol for zwlr_virtual_pointer_v1."""
 
@@ -843,6 +852,42 @@ def icon_box(rec, shot):
     cy = (min(ys) + max(ys)) // 2
     half = max(14, height // 2)
     return (max(0, cx - half), max(0, cy - half), 2 * half, min(2 * half, height)), (cx, cy)
+
+
+# The hero icon sits just left of the title, from its cap line down past its
+# meta line. The bounds keep the panel's border and the rows below out.
+HERO_LEFT = 44
+HERO_GAP = 4
+HERO_ABOVE = 12
+HERO_BELOW = 24
+
+
+def hero_box(rec, shot):
+    """Finds the panel hero's icon from the pixels left of the "Mullvad VPN"
+    title that differ from the panel's background, without assuming the
+    glyph. Returns a square box around it, padded so the badge corner fits,
+    and that background."""
+    title = find_text(rec, shot, "Mullvad VPN")
+    region = (title[0] - HERO_LEFT, title[1] - HERO_ABOVE, HERO_LEFT - HERO_GAP,
+              title[3] - title[1] + HERO_ABOVE + HERO_BELOW)
+    assert region[0] >= 0 and region[1] >= 0
+    w, h, pixels = read_rgb(shot, region)
+    background = pixels[0:3]
+    xs, ys = [], []
+    for index in range(w * h):
+        pixel = pixels[index * 3:index * 3 + 3]
+        if max(abs(pixel[c] - background[c]) for c in range(3)) > 24:
+            xs.append(index % w)
+            ys.append(index // w)
+    if not xs:
+        raise Failure("no hero icon pixels left of the panel title")
+    if min(xs) == 0 or min(ys) == 0 or max(xs) == w - 1 or max(ys) == h - 1:
+        raise Failure(f"pixels left of the panel title reach the edge of {region}; the search caught more than the icon")
+    side = max(max(xs) - min(xs), max(ys) - min(ys)) + 1 + 6
+    cx = region[0] + (min(xs) + max(xs)) // 2
+    cy = region[1] + (min(ys) + max(ys)) // 2
+    assert side > 6
+    return (cx - side // 2, cy - side // 2, side, side), background
 
 
 def pixel_stats(shot, box, background):
@@ -1065,6 +1110,19 @@ class Drive:
         keys(self.rec, *names, text=text)
         self.note(f"keys {list(names)}{' text ' + repr(text) if text is not None else ''}")
 
+    def hold(self, name, ms):
+        hold(self.rec, name, ms)
+        self.note(f"held {name} for {ms} ms")
+
+    def compare(self, results):
+        """Records every (ok, check, detail) and fails naming each failed
+        check, so one comparison never hides another."""
+        for ok, what, detail in results:
+            self.note(what, bool(ok), detail)
+        failed = [f"{what} ({detail})" for ok, what, detail in results if not ok]
+        if failed:
+            raise Failure("; ".join(failed))
+
     def click(self, point, button="left"):
         pointer(self.rec, point[0], point[1], button)
         self.note(f"{button} click at {point}")
@@ -1134,33 +1192,90 @@ def row(name):
     return LOGGED_IN_ROWS.index(name)
 
 
+# (name, stub state, settings change, IPC status, also capture the panel hero)
+ICON_STATES = [("active", {"tunnel": "connected"}, None, "Connected", True),
+               ("off", {}, None, "Disconnected", True),
+               ("warning", {"loggedIn": False}, None, "Not logged in", True),
+               ("tunnel-error", {"tunnel": "error"}, None, "Error · blocking all traffic", True),
+               ("lockdown", {}, lockdown_on, "Lockdown is blocking traffic", True),
+               ("daemon-down", {"daemon": False}, None, "Daemon is not running", False)]
+LUMA_STEP = 10  # Minimum mean-luma gap for "dimmer".
+REDNESS_STEP = 15  # Minimum mean-redness gap for "redder" and for a badge.
+
+
 def drive_bar_icon(d):
-    """Icon states from the stub daemon's state, then each pointer entry point."""
-    states = [("active", {"tunnel": "connected"}, None, "Connected"),
-              ("off", {}, None, "Disconnected"),
-              ("warning", {"loggedIn": False}, None, "Not logged in"),
-              ("problem", {}, lockdown_on, "Lockdown is blocking traffic"),
-              ("daemon-down", {"daemon": False}, None, "Daemon is not running")]
-    shots = {}
-    for name, state, settings, expected in states:
+    """Icon states from the stub daemon's state, in the bar and the panel
+    hero, then each pointer entry point."""
+    bar_shots, hero_shots = {}, {}
+    for name, state, settings, expected, hero in ICON_STATES:
         d.baseline(state, settings, expected)
         time.sleep(0.5)
-        shots[name] = d.shot("icon-" + name)
-    box, point = icon_box(d.rec, shots["active"])
-    _, _, background = read_rgb(shots["active"], (2, 2, 1, 1))
-    stats = {name: pixel_stats(shot, box, background) for name, shot in shots.items()}
-    write_json_atomic(os.path.join(d.out, "icon-stats.json"), {"box": box, "stats": stats})
-    d.check(changed_pixels(shots["active"], shots["off"], box) > 0, "off icon differs from active")
-    d.check(stats["off"]["all"]["luma"] < stats["active"]["all"]["luma"] - 10, "off icon is dimmed",
-            f"{stats['off']['all']} vs {stats['active']['all']}")
-    d.check(stats["warning"]["badge"]["redness"] > stats["off"]["badge"]["redness"] + 15,
-            "logged-out icon carries the warning badge", f"{stats['warning']['badge']} vs {stats['off']['badge']}")
-    d.check(stats["problem"]["all"]["redness"] > stats["active"]["all"]["redness"] + 15,
-            "blocking icon turns the urgent colour", f"{stats['problem']['all']} vs {stats['active']['all']}")
-    d.check(stats["daemon-down"]["badge"]["redness"] > stats["off"]["badge"]["redness"] + 15,
-            "daemon-down icon carries the warning badge")
+        bar_shots[name] = d.shot("icon-" + name)
+        if hero:
+            d.open_panel()
+            hero_shots[name] = d.shot("hero-" + name)
+    box, point = icon_box(d.rec, bar_shots["active"])
+    _, _, background = read_rgb(bar_shots["active"], (2, 2, 1, 1))
+    bar = {name: pixel_stats(shot, box, background) for name, shot in bar_shots.items()}
+    results = [(changed_pixels(bar_shots["active"], bar_shots["off"], box) > 0, "off icon differs from active", "")]
+    results += icon_comparisons("", bar) + bar_badge_comparisons(bar)
+    stats = {"bar": {"box": box, "stats": bar}}
+    try:
+        hero_at, hero_background = hero_box(d.rec, hero_shots["active"])
+    except Failure as error:
+        results.append((False, "the hero icon is found left of the panel title", str(error)))
+    else:
+        hero = {name: pixel_stats(shot, hero_at, hero_background) for name, shot in hero_shots.items()}
+        stats["hero"] = {"box": hero_at, "stats": hero}
+        results += icon_comparisons("hero ", hero) + hero_badge_comparisons(hero)
+    write_json_atomic(os.path.join(d.out, "icon-stats.json"), stats)
+    d.compare(results)
     d.baseline()
     drive_bar_clicks(d, point)
+
+
+def dimmer(stats, lower, upper):
+    return stats[lower]["all"]["luma"] < stats[upper]["all"]["luma"] - LUMA_STEP
+
+
+def redder(stats, region, more, less):
+    return stats[more][region]["redness"] > stats[less][region]["redness"] + REDNESS_STEP
+
+
+def versus(stats, region, a, b):
+    return f"{a} {stats[a][region]} vs {b} {stats[b][region]}"
+
+
+def icon_comparisons(prefix, s):
+    """Checks the bar icon and the hero share: off and lockdown are dimmed,
+    a tunnel error with the tunnel up is the full urgent colour."""
+    return [
+        (dimmer(s, "off", "active"), f"{prefix}off icon is dimmer than active", versus(s, "all", "off", "active")),
+        (redder(s, "all", "tunnel-error", "active"), f"{prefix}tunnel-error icon is the urgent colour",
+         versus(s, "all", "tunnel-error", "active")),
+        (redder(s, "all", "lockdown", "off"), f"{prefix}lockdown icon is the urgent colour",
+         versus(s, "all", "lockdown", "off")),
+        (dimmer(s, "lockdown", "tunnel-error"), f"{prefix}lockdown icon is dimmer than tunnel-error",
+         versus(s, "all", "lockdown", "tunnel-error")),
+    ]
+
+
+def bar_badge_comparisons(s):
+    return [
+        (redder(s, "badge", "warning", "off"), "logged-out icon carries the warning badge",
+         versus(s, "badge", "warning", "off")),
+        (redder(s, "badge", "daemon-down", "off"), "daemon-down icon carries the warning badge",
+         versus(s, "badge", "daemon-down", "off")),
+    ]
+
+
+def hero_badge_comparisons(s):
+    """The hero badges only problem states, unlike the bar. A problem's badge
+    sits on an urgent mark, so only its absence is measurable here."""
+    return [
+        (not redder(s, "badge", "warning", "off"), "hero logged-out icon carries no badge",
+         versus(s, "badge", "warning", "off")),
+    ]
 
 
 def drive_bar_clicks(d, point):
@@ -1259,7 +1374,8 @@ def drive_location(d):
     d.open_panel()
     d.goto(row("location"))
     d.keys("Return")
-    d.expect_text("picker-from-row", present=["Search countries and cities", "Albania", "Germany", "Gothenburg"])
+    d.expect_text("picker-from-row", present=PICKER_OPEN["present"] + ["Albania", "Germany", "Gothenburg"],
+                  absent=PICKER_OPEN["absent"])
     d.no_call(["mullvad", "relay"], 1.0)
     d.keys("Down", "Down")
     d.keys(text="l")
@@ -1267,7 +1383,7 @@ def drive_location(d):
     d.keys(text="h")
     d.expect_text("collapse-germany", present=["Germany"], absent=["Berlin"])
     d.keys("Escape")
-    d.expect_text("picker-closed", present=["Change location"], absent=["Search countries"])
+    d.expect_text("picker-closed", **PICKER_CLOSED)
     d.panel(True)
     d.keys(text="/")
     target = find_text(d.rec, d.expect_text("picker-from-slash", present=["Albania"]), "Albania")
@@ -1276,11 +1392,11 @@ def drive_location(d):
     d.take(["mullvad", "connect"])
     d.status("Connected")
     d.wait_settings("location al", location_is({"country": "al"}))
-    d.expect_text("chosen-albania", present=["Tirana, Albania"], absent=["Search countries"])
+    d.expect_text("chosen-albania", present=["Tirana, Albania", "Change location"], absent=PICKER_CLOSED["absent"])
     d.keys(text="/")
-    d.expect_text("search-escape-before", present=["Search countries and cities"])
+    d.expect_text("search-escape-before", **PICKER_OPEN)
     d.keys("Escape")
-    d.expect_text("search-escape-after", present=["Change location"], absent=["Search countries"])
+    d.expect_text("search-escape-after", **PICKER_CLOSED)
     d.keys(text="/")
     d.keys(text="stock")
     d.expect_text("search-stock", present=["Stockholm"], absent=["Albania Tirana", "Germany"])
@@ -1288,14 +1404,50 @@ def drive_location(d):
     d.take(["mullvad", "relay", "set", "location", "se", "sto"])
     d.no_call(["mullvad", "connect"], 1.0)
     d.wait_settings("location se/sto", location_is({"country": "se", "city": "sto"}))
-    d.expect_text("chosen-stockholm", present=["Stockholm, Sweden"], absent=["Search countries"])
+    d.expect_text("chosen-stockholm", present=["Stockholm, Sweden", "Change location"],
+                  absent=PICKER_CLOSED["absent"])
     # Return on the Location row must open the picker and choose nothing,
     # also right after a pick from a search.
     d.keys("Return")
-    d.expect_text("picker-after-search-pick", present=["Search countries and cities"])
+    d.expect_text("picker-after-search-pick", **PICKER_OPEN)
     d.no_call(["mullvad", "relay"], 1.5,
               what="Return on the Location row after a search pick opens the picker without choosing a location")
+    d.keys("Escape")
+    d.expect_text("picker-closed-again", **PICKER_CLOSED)
+    drive_location_held_return(d)
     d.baseline()
+
+
+# The picker's open and closed states, by text OCR reads reliably: tesseract
+# misreads the search placeholder's "Search" (as "bearch"), so a check for
+# its absence passes while the picker is open.
+PICKER_OPEN = {"present": ["Choose a country or city", "countries and cities"], "absent": ["Change location"]}
+PICKER_CLOSED = {"present": ["Change location"], "absent": ["Choose a country or city", "countries and cities"]}
+HOLD_MS = 1500  # Long enough for about 20 autorepeats after the 600 ms delay.
+
+
+def drive_location_held_return(d):
+    """A held Return autorepeats. On the Location row it opens the picker and
+    chooses nothing; in the search it chooses the first match once."""
+    d.goto(row("location"))
+    d.hold("Return", HOLD_MS)
+    d.expect_text("held-return-row", **PICKER_OPEN)
+    d.no_call(["mullvad", "relay"], 1.5, what="a held Return on the Location row chooses no location")
+    d.keys("Escape")
+    d.expect_text("held-return-row-closed", **PICKER_CLOSED)
+    d.keys(text="/")
+    # The search field shows autorepeat as repeated letters, which proves the
+    # hold reaches the widget as autorepeat.
+    d.hold("x", HOLD_MS)
+    d.expect_text("held-letter", present=["xxxxx"])
+    d.hold("BackSpace", 2500)
+    d.keys(text="malm")
+    d.expect_text("search-malm", present=["Malm", "Sweden"], absent=["Germany", "Albania"])
+    d.hold("Return", HOLD_MS)
+    d.take(["mullvad", "relay", "set", "location", "se", "mma"])
+    d.no_call(["mullvad", "relay"], 1.5, what="a held Return in the search chooses one location")
+    d.wait_settings("location se/mma", location_is({"country": "se", "city": "mma"}))
+    d.shot("held-return-search")
 
 
 SETTING_ROWS = [  # (row, on command, off command, settings.json probe)
@@ -1470,7 +1622,16 @@ def drive_once(rec, feature):
     drive.finish()
     write_json_atomic(os.path.join(out, "result.json"), {"feature": feature, "outcome": outcome, "detail": detail,
                                                          "revision": rec["revision"]})
+    append_result(rec, f"{os.path.relpath(out, rec['evidence'])} {result_line(outcome, feature, detail)}")
     return outcome, detail, out
+
+
+def append_result(rec, line):
+    """results.txt lists every drive attempt's result line in this run, and
+    so every failed check, in one file a verdict can cite."""
+    assert "\n" not in line
+    with open(os.path.join(rec["evidence"], "results.txt"), "a") as handle:
+        handle.write(f"{line} revision={rec['revision']}\n")
 
 
 def result_line(outcome, feature, detail):
@@ -1520,14 +1681,17 @@ def cmd_all(args):
         for feature in FEATURES:
             if not doctor_ok:
                 outcome, detail = "FAIL", "doctor failed; instance not worth driving"
+                append_result(rec, result_line(outcome, feature, detail))
             else:
                 outcome, detail, _ = drive_once(rec, feature)
             counts[outcome] += 1
             print(result_line(outcome, feature, detail))
     finally:
         cleaned = cmd_cleanup(argparse.Namespace(run=rec["id"])) == 0
-    print(f"all: {counts['PASS']} passed, {counts['FAIL']} failed, {counts['SKIP']} skipped"
-          + ("" if cleaned else "; cleanup FAILED"))
+    summary = (f"all: {counts['PASS']} passed, {counts['FAIL']} failed, {counts['SKIP']} skipped"
+               + ("" if cleaned else "; cleanup FAILED"))
+    append_result(rec, summary)
+    print(summary)
     print(f"evidence={rec['evidence']}")
     return 0 if counts["FAIL"] == 0 and cleaned else 1
 

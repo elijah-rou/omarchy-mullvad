@@ -51,7 +51,7 @@ verify-omarchy-mullvad drive <feature> [--run <id>] [--repeat N]
 Each feature in `features/` has one drive target. A drive seeds the stub daemon (the stub is the daemon, so this is seed data, not a widget setter), refreshes the widget through its `refresh` IPC call, and then acts the way a user does:
 
 - IPC: `qs ipc` into this run's instance (`open`, `close`, `toggle`, `refresh`, `connect`, `disconnect`, `toggleConnection`, `status`).
-- Keys: the README's panel keys (`j`/`k`, arrows, `Return`, `space`, `c`, `r`, `/`, `l`/`h`, `Escape`) and typed text.
+- Keys: the README's panel keys (`j`/`k`, arrows, `Return`, `space`, `c`, `r`, `/`, `l`/`h`, `Escape`), typed text, and held keys, which the run's compositor autorepeats after 600 ms at 25 per second.
 - Pointer: left, right, and middle clicks on the bar icon, which the CLI finds from bar pixels without assuming the glyph, and on panel rows, found by their OCR text.
 
 Every drive ends with one line: `PASS <feature>`, `FAIL <feature>: <check>`, or `SKIP <feature>: <missing prerequisite>`.
@@ -73,7 +73,8 @@ verify-omarchy-mullvad calls --last 10
 Each run gets one evidence directory, `~/.local/state/verify-omarchy-mullvad/evidence/<run id>/` (or `--evidence-root <dir>/<run id>/`). It sits outside the checkout and outside everything cleanup removes. It holds:
 
 - `launch.json`, plus `doctor-*.json` with the toolchain report.
-- `<feature>/<n>/` for each drive attempt, never overwritten. Each holds numbered screenshots, the OCR text beside each one, `steps.json` (every action and check), `calls.json` (the stub's recorded argv, the side-effect proof), and `result.json`. `bar-icon` adds `icon-stats.json`.
+- `results.txt`: one line per drive attempt (`<feature>/<n> PASS|FAIL|SKIP ...`, with the checkout's revision), and `all`'s summary line. It lists every failed check of the run in one file.
+- `<feature>/<n>/` for each drive attempt, never overwritten. Each holds numbered screenshots, the OCR text beside each one, `steps.json` (every action and check), `calls.json` (the stub's recorded argv, the side-effect proof), and `result.json`. `bar-icon` adds `icon-stats.json` (bar and panel hero).
 - `run-logs/` (compositor, bus, and shell logs) and `run-stub/` (the stub's state and full call log), both copied at cleanup.
 
 Proof standards:
@@ -113,13 +114,14 @@ Every input is a flag or argument, and nothing prompts.
 
 A change to this skill's verdict rules (this `SKILL.md`, or the proof and skip rules in `features/README.md`) sets this repository's verification policy and never passes on its own: its verdict is `verifier-blocked`, and it lands only by countersign (the `babysit-and-ship` skill's Countersign rule). Both files are policy paths `agentic verify --help` lists, so `agentic verify record` refuses any other passing verdict for them. A change only to feature files or drive scripts takes an ordinary verdict: trunk's copy of this skill decides it, and the reviewer treats a removed or loosened check as a finding.
 
-For other pull requests:
+Run this skill from trunk against the head (`all --checkout <PR head worktree>`); the head's skill may only add evidence for behavior trunk's skill does not cover, after the verifier reads its new steps as code. A pull request that deliberately changes a checked expectation in both the product and the skill (for example the bar icon's states, as #1 did) never passes on the head's skill alone, since trunk's skill still fails it; the verdict list below decides between `verifier-blocked` and `verifier-failed`. A pull request that adds behavior, or changes what a drive asserts, adds or changes the drive step that shows it in the same pull request.
 
-- `live-ui-verified` requires `all --checkout <PR head worktree>` with no feature failing, plus a drive of every feature whose files the change touches. Run the same drives with `--checkout` on main as the regression lane. Cite the evidence directory.
+- `live-ui-verified`: `all --checkout <PR head worktree>` with trunk's skill has no feature failing, plus a drive of every feature whose files the change touches; the same drives with `--checkout` on main are the regression lane. Cite the evidence directory and its `results.txt`.
+- `unit-test-verified`: a change only to `Model.js` or `tests/` has `test` passing, plus a drive of every feature that renders the changed function.
+- `type-check-only`: a change only to docs has `scripts/validate` passing.
 - A feature that fails on main and on the PR head at the same check is a pre-existing failure. It does not block a pull request that does not touch that feature. The verdict's evidence names it.
-- A `SKIP` never counts as a pass for its feature. A pull request that changes a skipped feature is `verifier-blocked` until the prerequisite exists.
-- A change only to `Model.js` or `tests/` needs `test` to pass, plus a drive of every feature that renders the changed function. A change only to docs needs `scripts/validate`, and its verdict is `type-check-only`.
-- Any failed check on the PR head that passes on main is `verifier-failed`.
+- `verifier-blocked`: a `SKIP` for a feature the pull request changes (a `SKIP` never counts as a pass for its feature, so this holds until the prerequisite exists); the change touches a policy path; or trunk's skill fails only checks that the pull request deliberately changes in both the product and the skill, the head's skill passes them, and nothing else fails. The evidence then names each such check (from trunk's run's `results.txt`, which lists every drive's result line and, for `bar-icon`, every failed comparison) and the pull request's stated reason for changing it. A drive stops at its first failed check, so the head's skill's run covers the checks after it, and the verifier reads the skill's diff to confirm it changes only the named expectations. Policy changes and such deliberate changes land only by countersign: the user decides.
+- `verifier-failed`: a failed check on the PR head that passes on main, for any reason the `verifier-blocked` bullet does not name, including a check trunk's skill fails that the pull request does not deliberately change in both the product and the skill.
 
 ## Gotchas
 

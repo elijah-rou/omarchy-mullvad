@@ -23,6 +23,7 @@ This directory is the maintained source for verifying what users of the Mullvad 
 - An action on the daemon is proved by the stub's recorded argv (`calls.json`). A settings change is also proved by a second, read-only view: the stub daemon's `settings.json` and the panel's text.
 - What must not happen is proved by its absence: no stub call of that kind within a stated window.
 - Bar icon states are proved by comparing pixels between states (changed, dimmer, redder, badge quadrant), never by the glyph's exact pixels.
+- `results.txt` in the run's evidence directory lists every drive attempt's result line, so every failed check of the run is in one file.
 - Every artifact sits under the feature's attempt directory. Its `steps.json` names the entry point used for each action.
 - `SKIP` is only for a missing tool the drives need (`missing_tools` in the control CLI), and names it. A missing seed state is a `FAIL` naming the precondition.
 - An entry point that cannot be reached is reported with the attempted command and the unmet precondition. It is never reported as verified through a different entry point.
@@ -40,8 +41,8 @@ Each feature file starts with an H1 title and one paragraph describing the behav
 
 ## Features
 
-- [Bar icon](./bar-icon.md): icon states for connected, off, logged out, blocking, and daemon down; left, right, and middle clicks; panel open, close, and toggle over IPC.
+- [Bar icon](./bar-icon.md): bar and panel hero icon states for connected, off, logged out, tunnel error, lockdown, and daemon down; left, right, and middle clicks; panel open, close, and toggle over IPC.
 - [Connection](./connection.md): connect, disconnect, and reconnect from IPC, keys, the power row, and the power switch; refusal while logged out; starting a stopped daemon.
-- [Location](./location.md): the country and city picker from the Location row and `/`, search, expand and collapse, picking by keyboard and by click.
+- [Location](./location.md): the country and city picker from the Location row and `/`, search, expand and collapse, picking by keyboard and by click, and a held `Return`.
 - [Settings](./settings.md): the seven daemon settings, DNS content blockers, and blockers disabled under custom DNS.
 - [Account](./account.md): logging in over stdin, copying the number, managing the account, logging out, creating an account, and the logged-out recovery rows.

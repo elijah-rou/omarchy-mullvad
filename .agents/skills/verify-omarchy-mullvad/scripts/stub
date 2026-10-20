@@ -14,6 +14,7 @@ starts. It never runs the real mullvad binary.
 import datetime
 import json
 import os
+import re
 import sys
 import time
 
@@ -74,6 +75,47 @@ def save_settings(settings):
     write_json_atomic(SETTINGS, settings)
 
 
+RELAY_COUNTRY = re.compile(r"^(?P<name>\S.*) \((?P<code>[a-z]+)\)$")
+RELAY_CITY = re.compile(r"^\t(?P<name>\S.*) \((?P<code>[a-z]+)\) @ ")
+RELAY_HOST = re.compile(r"^\t\t(?P<host>[a-z]+-[a-z]+-[a-z0-9-]+) \(")
+
+
+def relay_places():
+    """Maps (country, city) codes to (city, country, first hostname), read
+    from the relay list the stub serves; (country, None) maps to that
+    country's first city, as the daemon would pick some relay there."""
+    places = {}
+    country = city = None
+    with open(RELAYS) as handle:
+        for line in handle:
+            line = line.rstrip("\n")
+            if not line.strip():
+                continue
+            match = RELAY_COUNTRY.match(line) or RELAY_CITY.match(line) or RELAY_HOST.match(line)
+            if match is None:
+                fail(f"stub: unreadable relay list line {line!r}", 2)
+            if match.re is RELAY_COUNTRY:
+                country, city = match.groups(), None
+            elif match.re is RELAY_CITY:
+                city = match.groups()
+            elif (country[1], city[1]) not in places:
+                entry = (city[0], country[0], match.group("host"))
+                places[(country[1], city[1])] = entry
+                places.setdefault((country[1], None), entry)
+    assert places, "the relay list names no relay"
+    return places
+
+
+def relay_for(place):
+    """The relay a connected tunnel reports for a location constraint. An
+    unknown location is a fixture error, never a silent fallback."""
+    places = relay_places()
+    key = (place.get("country"), place.get("city"))
+    if key not in places:
+        fail(f"stub: location {key} is not in the relay list {RELAYS}", 2)
+    return places[key]
+
+
 def status_json(state):
     settings = load_settings()
     locked = settings.get("lockdown_mode") is True
@@ -85,12 +127,7 @@ def status_json(state):
         connected = tunnel in ("connected", "connecting")
         location = settings["relay_settings"]["normal"]["location"]
         place = (location.get("only") or {}).get("location") or {}
-        city, country, host = {
-            ("se", "got"): ("Gothenburg", "Sweden", "se-got-wg-001"),
-            ("se", "sto"): ("Stockholm", "Sweden", "se-sto-wg-001"),
-            ("de", "ber"): ("Berlin", "Germany", "de-ber-wg-001"),
-            ("de", "fra"): ("Frankfurt", "Germany", "de-fra-wg-001"),
-        }.get((place.get("country"), place.get("city")), ("Tirana", "Albania", "al-tia-wg-001"))
+        city, country, host = relay_for(place)
         if not connected:
             # Disconnected, the daemon reports where the machine appears from.
             city, country, host = "Testville", "Testland", None
