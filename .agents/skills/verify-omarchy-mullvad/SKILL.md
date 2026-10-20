@@ -38,7 +38,7 @@ The readiness signal is the line `ready run=<id> status='Disconnected'`. It is p
 verify-omarchy-mullvad doctor [--run <id>] [--strict-toolchain]
 ```
 
-Doctor is read-only. It checks that the compositor, bus, and shell sandboxes are running by recorded PID, that the compositor's only output is `VERIFY-1`, and that the shell's Quickshell instance belongs to this run and is not one of the user's instances. It also checks that the plugin directory resolves to `--checkout` and that the checkout's revision is unchanged since launch. Last, it checks that IPC answers, that the shell's `mullvad` calls reach the stub, and that every drive tool is installed. It writes `doctor-<time>.json` to the evidence directory and ends with `ok doctor` or `FAIL doctor`.
+Doctor is read-only. It checks that the compositor, bus, and shell sandboxes are running by recorded PID, that the compositor's only output is `VERIFY-1` and its config has no errors, and that the shell's Quickshell instance belongs to this run and is not one of the user's instances. It also checks that the plugin directory resolves to `--checkout` and that the checkout's revision is unchanged since launch. Last, it checks that IPC answers, that the shell's `mullvad` calls reach the stub, and that every drive tool is installed. It writes `doctor-<time>.json` to the evidence directory and ends with `ok doctor` or `FAIL doctor`.
 
 Doctor also runs the toolchain comparison that Dev loop defines.
 
