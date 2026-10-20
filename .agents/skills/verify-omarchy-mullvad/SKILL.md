@@ -32,10 +32,12 @@ Launch does this:
 
 The readiness signal is the line `ready run=<id> status='Disconnected'`. It is printed only once the widget's IPC `status` answers with a settled state (not `Checking…`) and the bar's layer surface `omarchy-bar` is mapped. On failure launch prints `FAIL launch: <reason>` and the run's log directory.
 
+Pass that `<id>` as `--run <id>` to every later command. Runs coexist, so a command without `--run` picks the run only while it is the only one; with several, it refuses and names them.
+
 ## Doctor
 
 ```sh
-verify-omarchy-mullvad doctor [--run <id>] [--strict-toolchain]
+verify-omarchy-mullvad doctor --run <id> [--strict-toolchain]
 ```
 
 Doctor is read-only. It checks that the compositor, bus, and shell sandboxes are running by recorded PID, that the compositor's only output is `VERIFY-1` and its config has no errors, and that the shell's Quickshell instance belongs to this run and is not one of the user's instances. It also checks that the plugin directory resolves to `--checkout` and that the checkout's revision is unchanged since launch. Last, it checks that IPC answers, that the shell's `mullvad` calls reach the stub, and that every drive tool is installed. It writes `doctor-<time>.json` to the evidence directory and ends with `ok doctor` or `FAIL doctor`.
@@ -45,7 +47,7 @@ Doctor also runs the toolchain comparison that Dev loop defines.
 ## Drive
 
 ```sh
-verify-omarchy-mullvad drive <feature> [--run <id>] [--repeat N]
+verify-omarchy-mullvad drive <feature> --run <id> [--repeat N]
 ```
 
 Each feature in `features/` has one drive target. A drive seeds the stub daemon (the stub is the daemon, so this is seed data, not a widget setter), refreshes the widget through its `refresh` IPC call, and then acts the way a user does:
@@ -59,13 +61,13 @@ Every drive ends with one line: `PASS <feature>`, `FAIL <feature>: <check>`, or 
 For diagnosis, the same levers are available one at a time:
 
 ```sh
-verify-omarchy-mullvad ipc status
-verify-omarchy-mullvad keys j j Return
-verify-omarchy-mullvad keys --text /
-verify-omarchy-mullvad click --icon --button right
-verify-omarchy-mullvad click --text Albania
-verify-omarchy-mullvad shot --ocr
-verify-omarchy-mullvad calls --last 10
+verify-omarchy-mullvad ipc status --run <id>
+verify-omarchy-mullvad keys j j Return --run <id>
+verify-omarchy-mullvad keys --text / --run <id>
+verify-omarchy-mullvad click --icon --button right --run <id>
+verify-omarchy-mullvad click --text Albania --run <id>
+verify-omarchy-mullvad shot --ocr --run <id>
+verify-omarchy-mullvad calls --last 10 --run <id>
 ```
 
 ## Evidence
@@ -87,17 +89,17 @@ Proof standards:
 ## Cleanup
 
 ```sh
-verify-omarchy-mullvad cleanup [--run <id>]
+verify-omarchy-mullvad cleanup --run <id>
 ```
 
-Cleanup signals each sandbox's PID-namespace init and its bwrap parent by recorded PID, never by name. Killing the namespace init ends every process inside it. Cleanup then checks that no process mentions the run directory in its command line or environment. It copies logs and stub state into the evidence, deletes `/tmp/vom.*` and the run record, and keeps the evidence. It prints `cleaned run=<id>; evidence kept at <dir>`, or `FAIL cleanup` with the leftover PIDs.
+Cleanup signals each sandbox's PID-namespace init and its bwrap parent by recorded PID, never by name, and only after `/proc/<pid>/cmdline` or `environ` shows the PID still names the run directory. A record left by a crash or reboot can hold PIDs that now belong to other processes; cleanup leaves those alone and prints `skipped ...` for each. Killing the namespace init ends every process inside it. Cleanup then checks that no process mentions the run directory in its command line or environment. It copies logs and stub state into the evidence, deletes the run's `/tmp/vom.*` directory (if it still exists) and the run record, and keeps the evidence. It prints `cleaned run=<id>; evidence kept at <dir>`, or `FAIL cleanup` with the leftover PIDs.
 
 ## Control CLI
 
 `verify-omarchy-mullvad --help`, and `--help` on each subcommand, show real examples. The subcommands:
 
 - `launch`, `doctor`, `drive <feature>`, `cleanup`: the sections above.
-- `all --checkout <path> --allow-host-window`: launch, doctor, every feature, and cleanup, which runs even after a failure. It ends with `all: P passed, F failed, S skipped` and exits 0 only when no feature failed and cleanup succeeded.
+- `all --checkout <path> --allow-host-window`: launch, doctor, every feature, and cleanup, which runs even after a failure. It drives and cleans up only the run it launched, whatever other runs exist. When launch or doctor fails it drives nothing: every feature gets `SKIP <feature>: not driven, launch failed` (or `doctor failed`). It ends with `all: P passed, F failed, S skipped` (plus `; not driven: <reason>` when nothing was driven) and exits 0 only when every feature passed and cleanup succeeded.
 - `test --checkout <path>`: the repository's node tests (Dev loop).
 - `map-check`: checks `features/` against `features/README.md` and the drive targets. `scripts/validate` runs it.
 - `ipc`, `keys`, `click`, `shot`, `calls`: single levers for diagnosis.
@@ -112,16 +114,33 @@ Every input is a flag or argument, and nothing prompts.
 
 ## Verdict rules
 
-A change to this skill's verdict rules (this `SKILL.md`, or the proof and skip rules in `features/README.md`) sets this repository's verification policy and never passes on its own: its verdict is `verifier-blocked`, and it lands only by countersign (the `babysit-and-ship` skill's Countersign rule). Both files are policy paths `agentic verify --help` lists, so `agentic verify record` refuses any other passing verdict for them. A change only to feature files or drive scripts takes an ordinary verdict: trunk's copy of this skill decides it, and the reviewer treats a removed or loosened check as a finding.
+A change to this skill's verdict rules (this `SKILL.md`, the proof and skip rules in `features/README.md`, or the `.claude/skills/verify-omarchy-mullvad/SKILL.md` pointer, which could point at other rules) sets this repository's verification policy and never passes on its own: its verdict is `verifier-blocked`, and it lands only by countersign (the `babysit-and-ship` skill's Countersign rule). All three are policy paths `agentic verify --help` lists, so `agentic verify record` refuses any other passing verdict for them. A change only to feature files or drive scripts takes an ordinary verdict: trunk's copy of this skill decides it, and the reviewer treats a removed or loosened check as a finding.
 
 Run this skill from trunk against the head (`all --checkout <PR head worktree>`); the head's skill may only add evidence for behavior trunk's skill does not cover, after the verifier reads its new steps as code. A pull request that deliberately changes a checked expectation in both the product and the skill (for example the bar icon's states, as #1 did) never passes on the head's skill alone, since trunk's skill still fails it; the verdict list below decides between `verifier-blocked` and `verifier-failed`. A pull request that adds behavior, or changes what a drive asserts, adds or changes the drive step that shows it in the same pull request.
 
-- `live-ui-verified`: `all --checkout <PR head worktree>` with trunk's skill has no feature failing, plus a drive of every feature whose files the change touches; the same drives with `--checkout` on main are the regression lane. Cite the evidence directory and its `results.txt`.
-- `unit-test-verified`: a change only to `Model.js` or `tests/` has `test` passing, plus a drive of every feature that renders the changed function.
-- `type-check-only`: a change only to docs has `scripts/validate` passing.
-- A feature that fails on main and on the PR head at the same check is a pre-existing failure. It does not block a pull request that does not touch that feature. The verdict's evidence names it.
-- `verifier-blocked`: a `SKIP` for a feature the pull request changes (a `SKIP` never counts as a pass for its feature, so this holds until the prerequisite exists); the change touches a policy path; or trunk's skill fails only checks that the pull request deliberately changes in both the product and the skill, the head's skill passes them, and nothing else fails. The evidence then names each such check (from trunk's run's `results.txt`, which lists every drive's result line and, for `bar-icon`, every failed comparison) and the pull request's stated reason for changing it. A drive stops at its first failed check, so the head's skill's run covers the checks after it, and the verifier reads the skill's diff to confirm it changes only the named expectations. Policy changes and such deliberate changes land only by countersign: the user decides.
-- `verifier-failed`: a failed check on the PR head that passes on main, for any reason the `verifier-blocked` bullet does not name, including a check trunk's skill fails that the pull request does not deliberately change in both the product and the skill.
+Which features a change touches. A path matches the first row that names it. A change whose diff, read in full, alters only comments is docs-only whatever file it is in.
+
+| Changed paths | Features touched | Needed |
+| --- | --- | --- |
+| `.agents/skills/verify-omarchy-mullvad/`, `.claude/skills/verify-omarchy-mullvad/` | every feature | trunk's skill's `all` on the head, plus the head's skill's `all` on the head |
+| `Panel.qml`, `Service.qml`, `Model.js`, `manifest.json` | every feature: these files serve all of them | `all` on the head and on main; `test` too for `Model.js` |
+| `MullvadIcon.qml` | `bar-icon` | `all` on the head and on main |
+| `tests/` | none | `test` on the head |
+| `README.md`, `AGENTS.md`, `LICENSE`, comment-only changes | none | a read of the diff, and `scripts/validate` on the head |
+| anything else, including `scripts/validate` and `.gitignore` | not mapped | none exists: `verifier-blocked` |
+
+Results:
+
+- A drive stops at its first failed check, so a failed feature hides the checks after it.
+- `all` that cannot launch, or whose doctor fails, drives nothing: every feature is `SKIP <feature>: not driven, ...`. Such a run is evidence for no feature, on main or on the head, and never a pre-existing failure. Fix the run and run `all` again.
+- A feature that fails on main and on the head at the same check is a pre-existing failure.
+
+Verdicts:
+
+- `live-ui-verified`: `all` on the head with trunk's skill passes every feature the change touches, none of them SKIPs, and every other feature passes too or is a pre-existing failure the change does not touch; `all` on main is the regression lane. Any behavior the change adds or changes appears in a drive step's evidence. Cite both evidence directories and their `results.txt`, and name each pre-existing failure.
+- `unit-test-verified`: a change only to `tests/` has `test` passing on the head and a read of its diff finding no removed or loosened assertion; or a docs-only change (`README.md`, `AGENTS.md`, `LICENSE`, comments) has a read of the diff confirming it matches the pull request's stated intent and changes no code, plus `scripts/validate` passing on the head. Name the read and the runs in the evidence.
+- `verifier-blocked`: a feature the change touches SKIPs or was not driven and cannot be driven; the change touches a feature that has a pre-existing failure and does not fix it (that feature has no passing drive, since the failure hides its later checks), with the evidence naming the failure; the change touches a path the table does not map; the change touches a policy path; or trunk's skill fails only checks that the pull request deliberately changes in both the product and the skill, the head's skill passes them, and nothing else fails. The evidence then names each such check (from trunk's run's `results.txt`, which lists every drive's result line and, for `bar-icon`, every failed comparison) and the pull request's stated reason for changing it. The head's skill's run covers the checks after each one, and the verifier reads the skill's diff to confirm it changes only the named expectations. Policy changes and such deliberate changes land only by countersign: the user decides.
+- `verifier-failed`: a needed drive, `test`, or `scripts/validate` fails on the head for any reason the `verifier-blocked` bullet does not name, including a check that passes on main and fails on the head, and a check trunk's skill fails that the pull request does not deliberately change in both the product and the skill.
 
 ## Gotchas
 

@@ -4,7 +4,7 @@ This directory is the maintained source for verifying what users of the Mullvad 
 
 ## Baseline preconditions
 
-- A run started by `verify-omarchy-mullvad launch --checkout <path> --allow-host-window` exists, and `verify-omarchy-mullvad doctor` passes for it. Never drive an instance this run did not start.
+- A run started by `verify-omarchy-mullvad launch --checkout <path> --allow-host-window` exists, and `verify-omarchy-mullvad doctor --run <id>` passes for it. Pass `--run <id>` from launch's `ready run=<id>` line to every command. Never drive an instance this run did not start.
 - The widget comes from the checkout under test, through the run's scratch `HOME` (`/tmp/vom.*/home/.config/omarchy/plugins/elijahrou.mullvad`).
 - The stub daemon starts logged in to the fake account `1111222233334444` (device `Verify Mole`), disconnected, and with the daemon up. Settings come from `scripts/fixtures/settings.json`: location Gothenburg, Sweden; LAN sharing on; quantum-resistant on; ad blocking on; everything else off. Its relay list (`scripts/fixtures/relay-list.txt`) has Albania (Tirana), Germany (Berlin, Dusseldorf, Frankfurt), and Sweden (Gothenburg, Malmö, Stockholm).
 - Every drive seeds the state it needs and returns the stub daemon to that baseline when it ends.
@@ -25,7 +25,7 @@ This directory is the maintained source for verifying what users of the Mullvad 
 - Bar icon states are proved by comparing pixels between states (changed, dimmer, redder, badge quadrant), never by the glyph's exact pixels.
 - `results.txt` in the run's evidence directory lists every drive attempt's result line, so every failed check of the run is in one file.
 - Every artifact sits under the feature's attempt directory. Its `steps.json` names the entry point used for each action.
-- `SKIP` is only for a missing tool the drives need (`missing_tools` in the control CLI), and names it. A missing seed state is a `FAIL` naming the precondition.
+- `SKIP` is only for a missing tool the drives need (`missing_tools` in the control CLI), and names it, or, in `all`, for every feature when launch or doctor failed (`not driven, ...`), since nothing was driven. A `SKIP` never counts as a pass. A missing seed state is a `FAIL` naming the precondition.
 - An entry point that cannot be reached is reported with the attempted command and the unmet precondition. It is never reported as verified through a different entry point.
 
 ## Feature file contract

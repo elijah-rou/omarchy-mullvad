@@ -196,9 +196,10 @@ def cmd_account(args, state):
         return
     if sub == "login":
         # The widget passes the number over stdin; argv must not hold it.
+        # Record the argv as called, so a drive can catch a number in it.
         number = sys.stdin.readline().strip()
-        record(["mullvad", "account", "login"], {"stdinIsTestAccount": number == TEST_ACCOUNT,
-                                                 "stdinDigits": len(number)})
+        record(["mullvad", "account"] + args, {"stdinIsTestAccount": number == TEST_ACCOUNT,
+                                               "stdinDigits": len(number)})
         if number != TEST_ACCOUNT:
             fail("Error: Invalid account number")
         state.update(loggedIn=True, account=number)
@@ -244,6 +245,7 @@ def main():
         record([name] + args)
         return
     if args[:2] != ["account", "login"]:
+        # Login records itself after reading stdin, with what stdin held.
         record(["mullvad"] + args)
     state = load_state()
     if args[:1] == ["version"]:

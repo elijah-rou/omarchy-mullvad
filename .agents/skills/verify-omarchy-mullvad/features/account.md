@@ -26,7 +26,7 @@ Preconditions:
 - `verify-omarchy-mullvad doctor` passes for this run.
 - The stub daemon is logged out and disconnected. The drive seeds it.
 
-- **Log in.** After `ipc open` (the panel shows `LOG IN` and `Create a new account`), `keys --text "1111 2222 3333 4444"` then `keys Return` records `mullvad account login`. The stub reports that stdin held the test number, and status becomes `Disconnected`. No recorded argv anywhere holds the number.
+- **Log in.** After `ipc open` (the panel shows `LOG IN` and `Create a new account`), `keys --text "1111 2222 3333 4444"` then `keys Return` records `mullvad account login` with no further arguments (the stub records the argv it was called with). The stub reports that stdin held the test number, and status becomes `Disconnected`. No recorded argv anywhere holds the number.
 - **Masked number.** On the account rows, the panel shows `4444`, `ACCOUNT`, and `Verify Mole`, and not `1111`.
 - **Copy.** `keys Return` on the number shows `Account number copied`, and `wl-paste` in the run's compositor returns the number.
 - **Manage.** `keys Return` on `Manage account` records `omarchy-launch-browser https://mullvad.net/account`.

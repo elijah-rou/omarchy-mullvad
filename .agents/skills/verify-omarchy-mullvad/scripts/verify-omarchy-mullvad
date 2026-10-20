@@ -107,28 +107,45 @@ def save_record(rec):
     os.replace(tmp, record_path(rec["id"]))
 
 
+def run_ids():
+    return sorted(f[:-5] for f in os.listdir(RUNS_DIR) if f.endswith(".json")) if os.path.isdir(RUNS_DIR) else []
+
+
 def load_record(run_id):
+    """Without --run, only a sole run is chosen: with several, guessing would
+    drive or clean up a run another shell launched."""
     if run_id is None:
-        runs = sorted(f[:-5] for f in os.listdir(RUNS_DIR) if f.endswith(".json")) if os.path.isdir(RUNS_DIR) else []
+        runs = run_ids()
         if not runs:
             die("no launched run; run `verify-omarchy-mullvad launch --checkout <path> --allow-host-window` first")
-        run_id = runs[-1]
+        if len(runs) > 1:
+            die(f"{len(runs)} runs exist ({', '.join(runs)}); pass --run <id>, the id launch printed "
+                "in its `ready run=<id>` line")
+        run_id = runs[0]
     if not os.path.exists(record_path(run_id)):
         die(f"no run {run_id}; list runs with `ls {RUNS_DIR}`")
     with open(record_path(run_id)) as handle:
         rec = json.load(handle)
-    assert rec["dir"].startswith(RUN_PREFIX)
+    assert rec["dir"].startswith(RUN_PREFIX) and len(rec["dir"]) > len(RUN_PREFIX)
     return rec
 
 
-def pid_alive(pid):
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+def run_owns_pid(rec, pid):
+    """True only while pid is a live process whose command line or environment
+    names this run's directory. A recorded PID can belong to another process
+    after a crash or reboot, and that process must never be signalled. Every
+    sandboxed process carries the run directory in its argv (bwrap and its
+    namespace init hold the `env -i HOME=<run dir>/home ...` arguments). A
+    zombie has an empty command line and counts as gone."""
+    needle = (rec["dir"] + "/").encode()
+    for name in ["cmdline", "environ"]:
+        try:
+            with open(f"/proc/{pid}/{name}", "rb") as handle:
+                if needle in handle.read():
+                    return True
+        except OSError:
+            return False
+    return False
 
 
 # Environment for clients that talk to this run's compositor and shell -----
@@ -442,6 +459,13 @@ def bar_layer(rec):
 
 
 def cmd_launch(args):
+    checkout, host_socket = launch_inputs(args)
+    return start_run(new_record(checkout, args.evidence_root), host_socket)
+
+
+def launch_inputs(args):
+    """Validates launch's flags before anything is created; returns the
+    checkout and the host Wayland socket."""
     checkout = os.path.realpath(args.checkout)
     if not os.path.isfile(os.path.join(checkout, "manifest.json")):
         die(f"{checkout} has no manifest.json; pass the plugin checkout with --checkout")
@@ -454,7 +478,13 @@ def cmd_launch(args):
     host_socket = host if host.startswith("/") else os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), host)
     if not os.path.exists(host_socket):
         die(f"host Wayland socket {host_socket} does not exist")
-    rec = new_record(checkout, args.evidence_root)
+    return checkout, host_socket
+
+
+def start_run(rec, host_socket):
+    """Starts the run rec names; returns launch's exit code. The record exists
+    before this starts anything, so a caller holding it can always clean up."""
+    assert os.path.exists(record_path(rec["id"]))
     try:
         make_run_dirs(rec)
         start_compositor(rec, host_socket)
@@ -465,7 +495,7 @@ def cmd_launch(args):
         print(f"FAIL launch: {error}")
         print(f"logs: {rec['dir']}/logs; clean up with `{SKILL} cleanup --run {rec['id']}`")
         return 1
-    write_evidence(rec, "launch.json", {"run": rec["id"], "checkout": checkout, "revision": rec["revision"],
+    write_evidence(rec, "launch.json", {"run": rec["id"], "checkout": rec["checkout"], "revision": rec["revision"],
                                         "status": status, "time": datetime.datetime.now().isoformat()})
     print(f"ready run={rec['id']} status={status!r}")
     print(f"evidence={rec['evidence']}")
@@ -519,21 +549,39 @@ def run_processes(rec):
 
 
 def stop_run(rec):
+    """Signals each sandbox's recorded init and bwrap PIDs, but only those
+    run_owns_pid confirms; returns the recorded PIDs it left alone."""
+    skipped = []
     for name in ["shell", "bus", "compositor"]:
         pids = rec["pids"].get(name)
         if not pids:
             continue
+        targets = []
+        for role in ["init", "bwrap"]:
+            if run_owns_pid(rec, pids[role]):
+                targets.append(pids[role])
+            elif os.path.exists(f"/proc/{pids[role]}"):
+                skipped.append(f"{name} {role} PID {pids[role]}")
         for sig in [signal.SIGTERM, signal.SIGKILL]:
-            for pid in [pids["init"], pids["bwrap"]]:
-                if pid_alive(pid):
-                    os.kill(pid, sig)
+            for pid in targets:
+                if run_owns_pid(rec, pid):
+                    signal_pid(pid, sig, skipped)
             try:
-                wait_until(lambda: not pid_alive(pids["init"]) and not pid_alive(pids["bwrap"]), 5,
-                           f"{name} to exit")
+                wait_until(lambda: not any(run_owns_pid(rec, pid) for pid in targets), 5, f"{name} to exit")
                 break
             except Failure:
                 continue
         reap(pids["bwrap"])
+    return skipped
+
+
+def signal_pid(pid, sig, skipped):
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        skipped.append(f"PID {pid} (not permitted to signal it)")
 
 
 def reap(pid):
@@ -544,8 +592,15 @@ def reap(pid):
 
 
 def cmd_cleanup(args):
-    rec = load_record(args.run)
-    stop_run(rec)
+    return cleanup_run(load_record(args.run))
+
+
+def cleanup_run(rec):
+    """Stops and deletes the run rec names and keeps its evidence. A record
+    left by a crash or reboot may name a run directory that no longer exists
+    and PIDs that now belong to other processes: those are left alone."""
+    for leftover in stop_run(rec):
+        print(f"skipped {leftover}: it is not this run's process (a reused PID); not signalled")
     leftovers = run_processes(rec)
     for name in ["logs", "stub"]:
         source = os.path.join(rec["dir"], name)
@@ -555,8 +610,12 @@ def cmd_cleanup(args):
         print(f"FAIL cleanup: processes from run {rec['id']} remain: {leftovers}")
         return 1
     assert rec["dir"].startswith(RUN_PREFIX) and len(rec["dir"]) > len(RUN_PREFIX)
-    shutil.rmtree(rec["dir"])
-    os.remove(record_path(rec["id"]))
+    if os.path.isdir(rec["dir"]):
+        shutil.rmtree(rec["dir"])
+    else:
+        print(f"run directory {rec['dir']} is already gone")
+    if os.path.exists(record_path(rec["id"])):
+        os.remove(record_path(rec["id"]))
     print(f"cleaned run={rec['id']}; evidence kept at {rec['evidence']}")
     return 0
 
@@ -625,7 +684,7 @@ def doctor_checks(rec):
 
     for name in ["compositor", "bus", "shell"]:
         pids = rec["pids"].get(name)
-        check(f"{name} sandbox running", pids and pid_alive(pids["init"]), json.dumps(pids))
+        check(f"{name} sandbox running", pids and run_owns_pid(rec, pids["init"]), json.dumps(pids))
     outputs = monitor_names(rec) if rec.get("hypr_sig") else []
     check("nested compositor has only the headless output", outputs == [HEADLESS_OUTPUT], str(outputs))
     errors = [e for e in (hyprctl_json(rec, "configerrors") or []) if str(e).strip()] if rec.get("hypr_sig") else []
@@ -1071,20 +1130,29 @@ class Drive:
         self.note(f"IPC status is {expected!r}")
 
     def take(self, argv, timeout_s=8):
-        """Waits for the stub to record argv after the last call already taken."""
+        """Waits for the stub to record exactly argv after the last call already taken."""
+        return self.take_matching(lambda recorded: recorded == argv, str(argv), timeout_s)
+
+    def take_starting(self, head, timeout_s=8):
+        """Waits for a call whose argv starts with head, so a check after it can
+        judge the whole argv rather than miss the call."""
+        return self.take_matching(lambda recorded: recorded[:len(head)] == head, f"{head} + any arguments",
+                                  timeout_s)
+
+    def take_matching(self, matches, described, timeout_s):
         def found():
             calls = read_calls(self.rec)
             for index in range(self.consumed, len(calls)):
-                if calls[index]["argv"] == argv:
+                if matches(calls[index]["argv"]):
                     return index + 1
             return 0
 
         try:
-            self.consumed = wait_until(found, timeout_s, f"stub call {argv}")
+            self.consumed = wait_until(found, timeout_s, f"stub call {described}")
         except Failure:
             recent = [c["argv"] for c in read_calls(self.rec)[self.consumed:]]
-            self.check(False, f"stub recorded {argv}", f"calls since last check: {recent}")
-        self.note(f"stub recorded {argv}")
+            self.check(False, f"stub recorded {described}", f"calls since last check: {recent}")
+        self.note(f"stub recorded {described}")
         time.sleep(ACTION_SETTLE_S)
         return read_calls(self.rec)[self.consumed - 1]
 
@@ -1532,7 +1600,9 @@ def drive_account(d):
     d.expect_text("logged-out", present=["LOG IN", "Create a new account"])
     d.keys(text="1111 2222 3333 4444")
     d.keys("Return")
-    login = d.take(["mullvad", "account", "login"])
+    login = d.take_starting(["mullvad", "account", "login"])
+    d.check(login["argv"] == ["mullvad", "account", "login"], "the login argv holds no account number",
+            str(login["argv"]))
     d.check(login.get("stdinIsTestAccount") is True, "the account number reached mullvad over stdin", json.dumps(login))
     d.status("Disconnected")
     d.collapse_dns()
@@ -1668,39 +1738,36 @@ def cmd_all(args):
     launch_args = argparse.Namespace(checkout=args.checkout, allow_host_window=args.allow_host_window,
                                      host_display=args.host_display, evidence_root=args.evidence_root)
     counts = {"PASS": 0, "FAIL": 0, "SKIP": 0}
-    if cmd_launch(launch_args) != 0:
-        run_id = latest_run_id()
-        print(f"all: 0 passed, {len(FEATURES)} failed, 0 skipped (launch failed)")
-        if run_id:
-            cmd_cleanup(argparse.Namespace(run=run_id))
-        return 1
-    rec = load_record(None)
+    checkout, host_socket = launch_inputs(launch_args)
+    # The run all drives and cleans up is the one it creates here, never
+    # another shell's run that happens to be newer.
+    rec = new_record(checkout, args.evidence_root)
+    not_driven = None
     try:
-        doctor_ok = cmd_doctor(argparse.Namespace(run=rec["id"], strict_toolchain=args.strict_toolchain,
-                                                  checkout=None, toolchain_only=False)) == 0
+        if start_run(rec, host_socket) != 0:
+            not_driven = "launch failed"
+        elif cmd_doctor(argparse.Namespace(run=rec["id"], strict_toolchain=args.strict_toolchain,
+                                           checkout=None, toolchain_only=False)) != 0:
+            not_driven = "doctor failed"
         for feature in FEATURES:
-            if not doctor_ok:
-                outcome, detail = "FAIL", "doctor failed; instance not worth driving"
+            if not_driven:
+                # Nothing was driven, so no feature passed or failed.
+                outcome, detail = "SKIP", "not driven, " + not_driven
                 append_result(rec, result_line(outcome, feature, detail))
             else:
                 outcome, detail, _ = drive_once(rec, feature)
             counts[outcome] += 1
             print(result_line(outcome, feature, detail))
     finally:
-        cleaned = cmd_cleanup(argparse.Namespace(run=rec["id"])) == 0
+        cleaned = cleanup_run(rec) == 0
     summary = (f"all: {counts['PASS']} passed, {counts['FAIL']} failed, {counts['SKIP']} skipped"
+               + (f"; not driven: {not_driven}" if not_driven else "")
                + ("" if cleaned else "; cleanup FAILED"))
     append_result(rec, summary)
     print(summary)
     print(f"evidence={rec['evidence']}")
-    return 0 if counts["FAIL"] == 0 and cleaned else 1
-
-
-def latest_run_id():
-    if not os.path.isdir(RUNS_DIR):
-        return None
-    runs = sorted(f[:-5] for f in os.listdir(RUNS_DIR) if f.endswith(".json"))
-    return runs[-1] if runs else None
+    assert sum(counts.values()) == len(FEATURES)
+    return 0 if counts["PASS"] == len(FEATURES) and cleaned else 1
 
 
 def cmd_test(args):
@@ -1814,25 +1881,24 @@ def cmd_calls(args):
     return 0
 
 
+EXAMPLE_RUN = "--run 20261020-210623-5791"
 EXAMPLES = {
     "launch": "verify-omarchy-mullvad launch --checkout ~/Projects/omarchy-mullvad --allow-host-window\n"
               "  verify-omarchy-mullvad launch --checkout /path/to/pr-worktree --allow-host-window "
               "--evidence-root /tmp/evidence",
-    "doctor": "verify-omarchy-mullvad doctor\n  verify-omarchy-mullvad doctor --run 20261020-210623-5791 "
-              "--strict-toolchain\n  verify-omarchy-mullvad doctor --toolchain-only --checkout /tmp/copy",
-    "drive": "verify-omarchy-mullvad drive bar-icon\n  verify-omarchy-mullvad drive connection\n"
-             "  verify-omarchy-mullvad drive location\n  verify-omarchy-mullvad drive settings\n"
-             "  verify-omarchy-mullvad drive account --repeat 3",
+    "doctor": f"verify-omarchy-mullvad doctor {EXAMPLE_RUN}\n  verify-omarchy-mullvad doctor {EXAMPLE_RUN} --strict-toolchain\n"
+              "  verify-omarchy-mullvad doctor --toolchain-only --checkout /tmp/copy",
+    "drive": f"verify-omarchy-mullvad drive bar-icon {EXAMPLE_RUN}\n  verify-omarchy-mullvad drive account {EXAMPLE_RUN} --repeat 3",
     "all": "verify-omarchy-mullvad all --checkout ~/Projects/omarchy-mullvad --allow-host-window",
-    "cleanup": "verify-omarchy-mullvad cleanup\n  verify-omarchy-mullvad cleanup --run 20261020-210623-5791",
+    "cleanup": f"verify-omarchy-mullvad cleanup {EXAMPLE_RUN}",
     "test": "verify-omarchy-mullvad test --checkout ~/Projects/omarchy-mullvad",
     "map-check": "verify-omarchy-mullvad map-check",
-    "ipc": "verify-omarchy-mullvad ipc status\n  verify-omarchy-mullvad ipc open",
-    "keys": "verify-omarchy-mullvad keys j j Return\n  verify-omarchy-mullvad keys --text /",
-    "click": "verify-omarchy-mullvad click --icon --button right\n  verify-omarchy-mullvad click --text Albania\n"
-             "  verify-omarchy-mullvad click --x 1240 --y 13",
-    "shot": "verify-omarchy-mullvad shot --ocr\n  verify-omarchy-mullvad shot --path /tmp/panel.png",
-    "calls": "verify-omarchy-mullvad calls --last 5",
+    "ipc": f"verify-omarchy-mullvad ipc status {EXAMPLE_RUN}\n  verify-omarchy-mullvad ipc open {EXAMPLE_RUN}",
+    "keys": f"verify-omarchy-mullvad keys j j Return {EXAMPLE_RUN}\n  verify-omarchy-mullvad keys --text / {EXAMPLE_RUN}",
+    "click": f"verify-omarchy-mullvad click --icon --button right {EXAMPLE_RUN}\n"
+             f"  verify-omarchy-mullvad click --text Albania {EXAMPLE_RUN}",
+    "shot": f"verify-omarchy-mullvad shot --ocr {EXAMPLE_RUN}",
+    "calls": f"verify-omarchy-mullvad calls --last 5 {EXAMPLE_RUN}",
 }
 
 
@@ -1885,7 +1951,8 @@ def build_parser():
     calls.add_argument("--last", type=int, default=20)
     for name, p in sub.choices.items():
         if name not in ("launch", "all", "test", "map-check"):
-            p.add_argument("--run", help="run id (default: the most recent launched run)")
+            p.add_argument("--run", help="run id from launch's `ready run=<id>` line "
+                                         "(required when more than one run exists)")
     return parser
 
 
