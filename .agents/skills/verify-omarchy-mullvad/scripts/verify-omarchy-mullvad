@@ -55,7 +55,8 @@ DISABLED_PLUGINS = [
 HYPR_CONFIG = """\
 hl.monitor({ output = "", mode = "1280x800", position = "auto", scale = 1 })
 hl.config({
-  misc = { disable_hyprland_logo = true, disable_splash_rendering = true },
+  -- The watchdog warning is a timed overlay that would cover the panel.
+  misc = { disable_hyprland_logo = true, disable_splash_rendering = true, disable_watchdog_warning = true },
   animations = { enabled = false },
   xwayland = { enabled = false },
   input = { kb_layout = "us" },
@@ -626,6 +627,8 @@ def doctor_checks(rec):
         check(f"{name} sandbox running", pids and pid_alive(pids["init"]), json.dumps(pids))
     outputs = monitor_names(rec) if rec.get("hypr_sig") else []
     check("nested compositor has only the headless output", outputs == [HEADLESS_OUTPUT], str(outputs))
+    errors = [e for e in (hyprctl_json(rec, "configerrors") or []) if str(e).strip()] if rec.get("hypr_sig") else []
+    check("nested compositor config has no errors", not errors, str(errors))
     check("shell instance belongs to this run", rec.get("qs_id") and rec["qs_id"] not in host_qs_ids(),
           str(rec.get("qs_id")))
     link = os.path.join(rec["home"], ".config/omarchy/plugins", PLUGIN_ID)
