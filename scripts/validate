@@ -24,6 +24,17 @@ if grep -nE '"account", "login", ' Service.qml; then
   exit 1
 fi
 
+# The verification skill's scripts parse, its feature map matches its drive
+# targets, and Claude Code's discovery copy carries the same frontmatter.
+skill=.agents/skills/verify-omarchy-mullvad
+python3 -c 'import ast, sys; [ast.parse(open(f).read(), f) for f in sys.argv[1:]]' \
+  "$skill/scripts/verify-omarchy-mullvad" "$skill/scripts/stub"
+"$skill/scripts/verify-omarchy-mullvad" map-check >/dev/null
+if ! diff <(sed -n '1,4p' "$skill/SKILL.md") <(sed -n '1,4p' .claude/skills/verify-omarchy-mullvad/SKILL.md); then
+  printf '.claude/skills/verify-omarchy-mullvad/SKILL.md frontmatter differs from %s/SKILL.md\n' "$skill" >&2
+  exit 1
+fi
+
 if command -v shellcheck >/dev/null 2>&1; then shellcheck scripts/validate; fi
 test -x scripts/validate
 printf 'validation passed\n'

@@ -1,0 +1,29 @@
+Albania (al)
+	Tirana (tia) @ 41.32795°N, 19.81902°W
+		al-tia-wg-001 (192.0.2.1, 2001:db8::1) - hosted by iRegister (rented)
+		al-tia-wg-002 (192.0.2.2, 2001:db8::2) - hosted by iRegister (rented)
+
+Germany (de)
+	Berlin (ber) @ 52.52001°N, 13.40495°W
+		de-ber-wg-001 (192.0.2.3, 2001:db8::3) - hosted by 31173 (Mullvad-owned)
+		de-ber-wg-002 (192.0.2.4, 2001:db8::4) - hosted by 31173 (Mullvad-owned)
+		de-ber-wg-003 (192.0.2.5, 2001:db8::5) - hosted by 31173 (Mullvad-owned)
+	Dusseldorf (dus) @ 51.23333°N, 6.78333°W
+		de-dus-wg-001 (192.0.2.6, 2001:db8::6) - hosted by xtom (Mullvad-owned)
+		de-dus-wg-002 (192.0.2.7, 2001:db8::7) - hosted by xtom (Mullvad-owned)
+	Frankfurt (fra) @ 50.11092°N, 8.68213°W
+		de-fra-wg-001 (192.0.2.8, 2001:db8::8) - hosted by M247 (rented)
+		de-fra-wg-002 (192.0.2.9, 2001:db8::9) - hosted by M247 (rented)
+
+Sweden (se)
+	Gothenburg (got) @ 57.70887°N, 11.97456°W
+		se-got-wg-001 (192.0.2.10, 2001:db8::a) - hosted by 31173 (Mullvad-owned)
+		se-got-wg-002 (192.0.2.11, 2001:db8::b) - hosted by 31173 (Mullvad-owned)
+	Malmö (mma) @ 55.60587°N, 13.00073°W
+		se-mma-wg-001 (192.0.2.12, 2001:db8::c) - hosted by 31173 (Mullvad-owned)
+		se-mma-wg-002 (192.0.2.13, 2001:db8::d) - hosted by 31173 (Mullvad-owned)
+	Stockholm (sto) @ 59.32938°N, 18.06871°W
+		se-sto-wg-001 (192.0.2.14, 2001:db8::e) - hosted by 31173 (Mullvad-owned)
+		se-sto-wg-002 (192.0.2.15, 2001:db8::f) - hosted by 31173 (Mullvad-owned)
+		se-sto-wg-003 (192.0.2.16, 2001:db8::10) - hosted by 31173 (Mullvad-owned)
+

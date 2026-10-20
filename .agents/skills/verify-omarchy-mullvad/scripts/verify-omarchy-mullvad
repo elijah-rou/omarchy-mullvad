@@ -1,0 +1,1742 @@
+#!/usr/bin/env python3
+"""Control CLI for verifying the Omarchy Mullvad bar widget.
+
+It starts a private Omarchy shell (Quickshell) inside a nested Hyprland that
+it starts itself, loads the plugin from the checkout under test, puts a stub
+`mullvad` CLI in place of the real one, and drives the widget the way a user
+does: IPC calls, keystrokes, and pointer clicks into the nested compositor
+only. Evidence lands outside the checkout and survives cleanup.
+
+Written in Python rather than the product's QML/JavaScript: the work is
+process orchestration, the Wayland wire protocol, and image parsing, which the
+system python3 covers with its standard library, independent of the node
+toolchain the product's own tests use.
+"""
+
+import argparse
+import datetime
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+
+SKILL = "verify-omarchy-mullvad"
+SCRIPTS = os.path.dirname(os.path.realpath(__file__))
+FIXTURES = os.path.join(SCRIPTS, "fixtures")
+PLUGIN_ID = "elijahrou.mullvad"
+OMARCHY_PATH = "/usr/share/omarchy"
+SHELL_PATH = OMARCHY_PATH + "/shell"
+STATE_ROOT = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), SKILL)
+RUNS_DIR = os.path.join(STATE_ROOT, "runs")
+EVIDENCE_ROOT_DEFAULT = os.path.join(STATE_ROOT, "evidence")
+RUN_PREFIX = "/tmp/vom."  # Short on purpose: Wayland socket paths must fit in 108 bytes.
+SANDBOX_MASKS = ["/run/user", "/run/dbus"]
+MULLVAD_SOCKET = "/var/run/mullvad-vpn"
+HEADLESS_OUTPUT = "VERIFY-1"
+FEATURES = ["bar-icon", "connection", "location", "settings", "account"]
+
+# First-party plugins the private shell must not load: they talk to the
+# session (notifications, polkit, idle, lock, media) or are irrelevant here.
+DISABLED_PLUGINS = [
+    "omarchy.background", "omarchy.battery", "omarchy.clipboard", "omarchy.emojis",
+    "omarchy.idle", "omarchy.image-picker", "omarchy.lock", "omarchy.media",
+    "omarchy.nightlight", "omarchy.notifications", "omarchy.osd", "omarchy.polkit",
+    "omarchy.reminders", "omarchy.agents", "omarchy.dev-gallery",
+]
+
+HYPR_CONFIG = """\
+hl.monitor({ output = "", mode = "1280x800", position = "auto", scale = 1 })
+hl.config({
+  misc = { disable_hyprland_logo = true, disable_splash_rendering = true },
+  animations = { enabled = false },
+  xwayland = { enabled = false },
+  input = { kb_layout = "us" },
+})
+"""
+
+
+class Failure(Exception):
+    """A check failed; the message names the check."""
+
+
+def die(message, code=2):
+    sys.stderr.write(f"{SKILL}: {message}\n")
+    sys.exit(code)
+
+
+def now_id():
+    return datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(2)
+
+
+def wait_until(predicate, timeout_s, what, interval_s=0.1):
+    """Polls predicate until it returns a truthy value or the deadline passes."""
+    assert timeout_s > 0
+    assert interval_s > 0
+    deadline = time.monotonic() + timeout_s
+    while True:
+        value = predicate()
+        if value:
+            return value
+        if time.monotonic() > deadline:
+            raise Failure(f"timed out after {timeout_s}s waiting for {what}")
+        time.sleep(interval_s)
+
+
+# Run records -------------------------------------------------------------
+
+
+def record_path(run_id):
+    return os.path.join(RUNS_DIR, run_id + ".json")
+
+
+def save_record(rec):
+    os.makedirs(RUNS_DIR, exist_ok=True)
+    tmp = record_path(rec["id"]) + ".tmp"
+    with open(tmp, "w") as handle:
+        json.dump(rec, handle, indent=2)
+    os.replace(tmp, record_path(rec["id"]))
+
+
+def load_record(run_id):
+    if run_id is None:
+        runs = sorted(f[:-5] for f in os.listdir(RUNS_DIR) if f.endswith(".json")) if os.path.isdir(RUNS_DIR) else []
+        if not runs:
+            die("no launched run; run `verify-omarchy-mullvad launch --checkout <path> --allow-host-window` first")
+        run_id = runs[-1]
+    if not os.path.exists(record_path(run_id)):
+        die(f"no run {run_id}; list runs with `ls {RUNS_DIR}`")
+    with open(record_path(run_id)) as handle:
+        rec = json.load(handle)
+    assert rec["dir"].startswith(RUN_PREFIX)
+    return rec
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+# Environment for clients that talk to this run's compositor and shell -----
+
+
+def client_env(rec, extra=None):
+    """Only this run's sockets: the user's session variables never pass through."""
+    env = {
+        "PATH": "/usr/bin",
+        "HOME": rec["home"],
+        "XDG_RUNTIME_DIR": rec["runtime"],
+        "LANG": "C.UTF-8",
+    }
+    if rec.get("wayland"):
+        env["WAYLAND_DISPLAY"] = rec["wayland"]
+    if rec.get("hypr_sig"):
+        env["HYPRLAND_INSTANCE_SIGNATURE"] = rec["hypr_sig"]
+    env.update(extra or {})
+    return env
+
+
+def run_client(rec, argv, timeout_s=10, check=True, extra_env=None, input_text=None):
+    result = subprocess.run(argv, env=client_env(rec, extra_env), capture_output=True, text=True,
+                            timeout=timeout_s, input=input_text)
+    if check and result.returncode != 0:
+        raise Failure(f"`{' '.join(argv)}` exited {result.returncode}: {result.stderr.strip()[:300]}")
+    return result
+
+
+def hyprctl_json(rec, what):
+    result = run_client(rec, ["hyprctl", "--instance", rec["hypr_sig"], "-j", what], check=False)
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout)
+    except ValueError:
+        return None
+
+
+IPC_ERROR = re.compile(r"^(Target not found|Function not found|No running instances)", re.MULTILINE)
+
+
+def ipc(rec, method):
+    """Calls the widget's IpcHandler in this run's shell instance only. qs
+    reports IPC-level errors on stdout with exit 0, so match those too."""
+    if not rec.get("qs_id"):
+        raise Failure(f"ipc {method}: this run has no shell instance")
+    result = run_client(rec, ["qs", "ipc", "--id", rec["qs_id"], "call", "--", PLUGIN_ID, method], check=False)
+    output = result.stdout.strip()
+    if result.returncode != 0 or IPC_ERROR.search(output):
+        raise Failure(f"ipc {method} failed: {(output or result.stderr.strip())[:200]}")
+    return output
+
+
+def find_qs_instance(rec):
+    result = run_client(rec, ["qs", "list", "--all", "--json"], check=False)
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        instances = json.loads(result.stdout)
+    except ValueError:
+        return None
+    for instance in instances:
+        if str(instance.get("config_path", "")).startswith(SHELL_PATH):
+            return instance.get("id")
+    return None
+
+
+# Sandboxes ---------------------------------------------------------------
+
+
+def render_nodes():
+    nodes = sorted(n for n in os.listdir("/dev/dri") if n.startswith("renderD")) if os.path.isdir("/dev/dri") else []
+    if not nodes:
+        die("no GPU render node under /dev/dri; Hyprland cannot render")
+    return ["/dev/dri/" + n for n in nodes]
+
+
+def sandbox_argv(binds, info_fd):
+    """bwrap around one process tree: the real filesystem, a minimal /dev with
+    render nodes only (no input devices, no KMS cards), no network, the user's
+    runtime directory and system bus masked, and the Mullvad daemon socket
+    replaced so nothing inside can reach the real daemon."""
+    argv = ["bwrap", "--unshare-pid", "--unshare-ipc", "--unshare-net", "--new-session",
+            "--bind", "/", "/", "--dev", "/dev", "--proc", "/proc"]
+    for node in render_nodes():
+        argv += ["--dev-bind", node, node]
+    for mask in SANDBOX_MASKS:
+        if os.path.isdir(mask):
+            argv += ["--tmpfs", mask]
+    if os.path.exists(MULLVAD_SOCKET):
+        argv += ["--ro-bind", "/dev/null", MULLVAD_SOCKET]
+    for source, target, mode in binds:
+        argv += ["--ro-bind" if mode == "ro" else "--bind", source, target]
+    return argv + ["--info-fd", str(info_fd), "--"]
+
+
+def spawn_sandboxed(rec, name, binds, env, argv):
+    """Starts argv in its own sandbox and session; returns the PID of the
+    sandbox's PID-namespace init (killing it ends every process inside)."""
+    log = open(os.path.join(rec["dir"], "logs", name + ".log"), "w")
+    read_fd, write_fd = os.pipe()
+    full = sandbox_argv(binds, write_fd) + ["env", "-i"] + [f"{k}={v}" for k, v in env.items()] + argv
+    proc = subprocess.Popen(full, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                            start_new_session=True, pass_fds=(write_fd,))
+    os.close(write_fd)
+    log.close()
+    info = b""
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and b"}" not in info:
+        chunk = os.read(read_fd, 4096)
+        if not chunk:
+            break
+        info += chunk
+    os.close(read_fd)
+    if b"child-pid" not in info:
+        proc.kill()
+        raise Failure(f"{name} sandbox did not start; see {rec['dir']}/logs/{name}.log")
+    child = json.loads(info.decode())["child-pid"]
+    rec["pids"][name] = {"bwrap": proc.pid, "init": child}
+    save_record(rec)
+    return child
+
+
+# Launch ------------------------------------------------------------------
+
+BUS_CONFIG = """<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:path={socket}</listen>
+  <auth>EXTERNAL</auth>
+  <servicedir>{services}</servicedir>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+"""
+
+def shell_config():
+    """The private shell's shell.json: a bar holding only this widget."""
+    return {
+        "version": 1,
+        "idle": {"screensaver": 0, "lock": 0},
+        "bar": {"position": "top", "transparent": False,
+                "layout": {"left": [], "center": [], "right": [{"id": PLUGIN_ID}]}},
+        "disabledPlugins": DISABLED_PLUGINS,
+        "plugins": [],
+    }
+
+
+def default_stub_state():
+    return {"daemon": True, "loggedIn": True, "account": "1111222233334444",
+            "device": "Verify Mole", "tunnel": "disconnected", "errorCause": None, "blockFailure": None}
+
+
+def checkout_revision(checkout):
+    head = subprocess.run(["git", "-C", checkout, "rev-parse", "HEAD"], capture_output=True, text=True)
+    dirty = subprocess.run(["git", "-C", checkout, "status", "--porcelain", "--untracked-files=no"],
+                           capture_output=True, text=True)
+    revision = head.stdout.strip() if head.returncode == 0 else "unknown"
+    return revision + ("+dirty" if dirty.stdout.strip() else "")
+
+
+def make_run_dirs(rec):
+    root = rec["dir"]
+    for sub in ["run", "home/.config/omarchy/plugins", "home/.local/state", "home/.cache", "home/.local/share",
+                "bin", "stub", "etc-mullvad", "logs", "dbus-services"]:
+        os.makedirs(os.path.join(root, sub), exist_ok=True)
+    os.chmod(rec["runtime"], 0o700)
+    with open(os.path.join(root, "home/.config/omarchy/shell.json"), "w") as handle:
+        json.dump(shell_config(), handle, indent=2)
+    os.symlink(rec["checkout"], os.path.join(root, "home/.config/omarchy/plugins", PLUGIN_ID))
+    for name in ["mullvad", "pkexec", "omarchy-launch-browser"]:
+        os.symlink(os.path.join(SCRIPTS, "stub"), os.path.join(root, "bin", name))
+    shutil.copy(os.path.join(FIXTURES, "settings.json"), os.path.join(root, "etc-mullvad", "settings.json"))
+    with open(os.path.join(root, "stub", "state.json"), "w") as handle:
+        json.dump(default_stub_state(), handle, indent=2)
+    open(os.path.join(root, "stub", "calls.jsonl"), "w").close()
+    with open(os.path.join(root, "hypr.lua"), "w") as handle:
+        handle.write(HYPR_CONFIG)
+    with open(os.path.join(root, "bus.conf"), "w") as handle:
+        handle.write(BUS_CONFIG.format(socket=rec["bus"], services=os.path.join(root, "dbus-services")))
+
+
+def base_env(rec):
+    home = rec["home"]
+    return {"PATH": "/usr/bin", "HOME": home, "XDG_RUNTIME_DIR": rec["runtime"],
+            "XDG_CONFIG_HOME": home + "/.config", "XDG_STATE_HOME": home + "/.local/state",
+            "XDG_CACHE_HOME": home + "/.cache", "XDG_DATA_HOME": home + "/.local/share",
+            "LANG": "C.UTF-8", "XCURSOR_SIZE": "24"}
+
+
+def start_compositor(rec, host_socket):
+    host_link = os.path.join(rec["dir"], "host-wayland")
+    env = base_env(rec)
+    env.update(WAYLAND_DISPLAY=host_link, HYPRLAND_NO_SD_NOTIFY="1", HYPRLAND_NO_CRASHREPORTER="1",
+               HYPRLAND_NO_SD_VARS="1")
+    spawn_sandboxed(rec, "compositor", [(host_socket, host_link, "rw")], env,
+                    ["Hyprland", "--config", os.path.join(rec["dir"], "hypr.lua")])
+
+    def nested_ready():
+        sockets = [n for n in os.listdir(rec["runtime"]) if re.fullmatch(r"wayland-\d+", n)]
+        sig_dir = os.path.join(rec["runtime"], "hypr")
+        sigs = os.listdir(sig_dir) if os.path.isdir(sig_dir) else []
+        if not sockets or not sigs:
+            return False
+        rec["wayland"] = sockets[0]
+        rec["hypr_sig"] = sigs[0]
+        return bool(hyprctl_json(rec, "monitors"))
+
+    wait_until(nested_ready, 30, "the nested Hyprland to answer hyprctl")
+    save_record(rec)
+    move_to_headless_output(rec)
+
+
+def move_to_headless_output(rec):
+    """The Wayland backend opens a window on the host only to get a GPU
+    allocator. Give the nested compositor a headless output and close that
+    window, so nothing stays on the user's desktop and host input never
+    reaches this run."""
+    run_client(rec, ["hyprctl", "--instance", rec["hypr_sig"], "output", "create", "headless", HEADLESS_OUTPUT])
+    wait_until(lambda: HEADLESS_OUTPUT in monitor_names(rec), 10, f"output {HEADLESS_OUTPUT}")
+    for name in monitor_names(rec):
+        if name.startswith("WAYLAND-"):
+            run_client(rec, ["hyprctl", "--instance", rec["hypr_sig"], "output", "remove", name])
+    wait_until(lambda: monitor_names(rec) == [HEADLESS_OUTPUT], 10, f"only output {HEADLESS_OUTPUT} to remain")
+
+
+def monitor_names(rec):
+    return [m.get("name") for m in hyprctl_json(rec, "monitors") or []]
+
+
+def start_bus(rec):
+    env = base_env(rec)
+    env["WAYLAND_DISPLAY"] = rec["wayland"]
+    spawn_sandboxed(rec, "bus", [], env, ["dbus-daemon", "--nofork", "--config-file",
+                                         os.path.join(rec["dir"], "bus.conf")])
+    wait_until(lambda: os.path.exists(rec["bus"]), 10, "the run's D-Bus socket")
+
+
+def boundary_binds(rec):
+    """The stub replaces every path the shell could reach the boundaries by."""
+    stub = os.path.join(SCRIPTS, "stub")
+    binds = [(os.path.join(rec["dir"], "etc-mullvad"), "/etc/mullvad-vpn", "rw")]
+    targets = set()
+    for name in ["mullvad", "pkexec", "omarchy-launch-browser"]:
+        for directory in ["/usr/bin", OMARCHY_PATH + "/bin"]:
+            target = os.path.join(directory, name)
+            if os.path.exists(target):
+                targets.add(os.path.realpath(target))
+    # A symlink resolves to a bound file, so binding real paths covers both.
+    return binds + [(stub, target, "ro") for target in sorted(targets)]
+
+
+def start_shell(rec, host_ids):
+    if not os.path.isdir("/etc/mullvad-vpn"):
+        raise Failure("/etc/mullvad-vpn is missing; the sandbox binds the stub's settings there")
+    env = base_env(rec)
+    env.update(PATH=os.path.join(rec["dir"], "bin") + ":" + OMARCHY_PATH + "/bin:/usr/bin",
+               WAYLAND_DISPLAY=rec["wayland"], QT_QPA_PLATFORM="wayland",
+               OMARCHY_PATH=OMARCHY_PATH, DBUS_SESSION_BUS_ADDRESS="unix:path=" + rec["bus"],
+               STUB_DIR=os.path.join(rec["dir"], "stub"), STUB_SETTINGS="/etc/mullvad-vpn/settings.json",
+               STUB_RELAYS=os.path.join(FIXTURES, "relay-list.txt"))
+    spawn_sandboxed(rec, "shell", boundary_binds(rec), env, ["qs", "--path", SHELL_PATH, "--no-color", "--log-times"])
+
+    def instance():
+        found = find_qs_instance(rec)
+        return found if found and found not in host_ids else None
+
+    rec["qs_id"] = wait_until(instance, 30, "the private shell's Quickshell instance")
+    save_record(rec)
+
+
+def host_qs_ids():
+    """Instance IDs of shells already running in the user's session, which
+    this run must never address."""
+    result = subprocess.run(["qs", "list", "--all", "--json"], capture_output=True, text=True, timeout=10)
+    try:
+        return {i.get("id") for i in json.loads(result.stdout or "[]")}
+    except ValueError:
+        return set()
+
+
+def wait_ready(rec):
+    """Ready means the widget is usable: its IPC target answers with a
+    settled state and the bar's layer surface is mapped."""
+    def settled():
+        try:
+            text = ipc(rec, "status")
+        except Failure:
+            return None
+        return text if text and text != "Checking…" else None
+
+    status = wait_until(settled, 40, "the widget's IPC status to settle", interval_s=0.5)
+    wait_until(lambda: bar_layer(rec), 20, "the bar's layer surface")
+    return status
+
+
+def bar_layer(rec):
+    layers = hyprctl_json(rec, "layers") or {}
+    for monitor in layers.values():
+        for level in (monitor.get("levels") or {}).values():
+            for layer in level:
+                if layer.get("namespace", "").startswith("omarchy") or "bar" in layer.get("namespace", ""):
+                    if layer.get("h", 0) < 100:
+                        return layer
+    return None
+
+
+def cmd_launch(args):
+    checkout = os.path.realpath(args.checkout)
+    if not os.path.isfile(os.path.join(checkout, "manifest.json")):
+        die(f"{checkout} has no manifest.json; pass the plugin checkout with --checkout")
+    if not args.allow_host_window:
+        die("launch opens a nested Hyprland window on your desktop (no headless backend is available); "
+            "pass --allow-host-window to accept it")
+    host = args.host_display or os.environ.get("WAYLAND_DISPLAY")
+    if not host:
+        die("no host Wayland display; pass --host-display /run/user/$UID/wayland-N")
+    host_socket = host if host.startswith("/") else os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), host)
+    if not os.path.exists(host_socket):
+        die(f"host Wayland socket {host_socket} does not exist")
+    rec = new_record(checkout, args.evidence_root)
+    try:
+        make_run_dirs(rec)
+        start_compositor(rec, host_socket)
+        start_bus(rec)
+        start_shell(rec, host_qs_ids())
+        status = wait_ready(rec)
+    except Failure as error:
+        print(f"FAIL launch: {error}")
+        print(f"logs: {rec['dir']}/logs; clean up with `{SKILL} cleanup --run {rec['id']}`")
+        return 1
+    write_evidence(rec, "launch.json", {"run": rec["id"], "checkout": checkout, "revision": rec["revision"],
+                                        "status": status, "time": datetime.datetime.now().isoformat()})
+    print(f"ready run={rec['id']} status={status!r}")
+    print(f"evidence={rec['evidence']}")
+    return 0
+
+
+def new_record(checkout, evidence_root):
+    run_id = now_id()
+    directory = tempfile.mkdtemp(prefix=os.path.basename(RUN_PREFIX), dir=os.path.dirname(RUN_PREFIX))
+    evidence = os.path.join(evidence_root or EVIDENCE_ROOT_DEFAULT, run_id)
+    os.makedirs(evidence, exist_ok=True)
+    rec = {"id": run_id, "dir": directory, "runtime": os.path.join(directory, "run"),
+           "home": os.path.join(directory, "home"), "bus": os.path.join(directory, "run", "bus"),
+           "checkout": checkout, "revision": checkout_revision(checkout), "evidence": evidence,
+           "pids": {}, "wayland": None, "hypr_sig": None, "qs_id": None}
+    save_record(rec)
+    return rec
+
+
+def write_evidence(rec, relative, data):
+    target = os.path.join(rec["evidence"], relative)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    with open(target, "w") as handle:
+        if isinstance(data, str):
+            handle.write(data)
+        else:
+            json.dump(data, handle, indent=2, ensure_ascii=False)
+    return target
+
+
+# Cleanup -----------------------------------------------------------------
+
+
+def run_processes(rec):
+    """Processes whose command line or environment names this run's directory."""
+    found = []
+    needle = rec["dir"].encode()
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as handle:
+                cmdline = handle.read()
+            with open(f"/proc/{entry}/environ", "rb") as handle:
+                environ = handle.read()
+        except OSError:
+            continue
+        if needle in cmdline or needle in environ:
+            found.append((int(entry), cmdline.replace(b"\0", b" ").decode(errors="replace")[:120]))
+    return found
+
+
+def stop_run(rec):
+    for name in ["shell", "bus", "compositor"]:
+        pids = rec["pids"].get(name)
+        if not pids:
+            continue
+        for sig in [signal.SIGTERM, signal.SIGKILL]:
+            for pid in [pids["init"], pids["bwrap"]]:
+                if pid_alive(pid):
+                    os.kill(pid, sig)
+            try:
+                wait_until(lambda: not pid_alive(pids["init"]) and not pid_alive(pids["bwrap"]), 5,
+                           f"{name} to exit")
+                break
+            except Failure:
+                continue
+        reap(pids["bwrap"])
+
+
+def reap(pid):
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        pass
+
+
+def cmd_cleanup(args):
+    rec = load_record(args.run)
+    stop_run(rec)
+    leftovers = run_processes(rec)
+    for name in ["logs", "stub"]:
+        source = os.path.join(rec["dir"], name)
+        if os.path.isdir(source):
+            shutil.copytree(source, os.path.join(rec["evidence"], "run-" + name), dirs_exist_ok=True)
+    if leftovers:
+        print(f"FAIL cleanup: processes from run {rec['id']} remain: {leftovers}")
+        return 1
+    assert rec["dir"].startswith(RUN_PREFIX) and len(rec["dir"]) > len(RUN_PREFIX)
+    shutil.rmtree(rec["dir"])
+    os.remove(record_path(rec["id"]))
+    print(f"cleaned run={rec['id']}; evidence kept at {rec['evidence']}")
+    return 0
+
+
+
+# Doctor ------------------------------------------------------------------
+
+REQUIRED_TOOLS = ["bwrap", "Hyprland", "hyprctl", "qs", "dbus-daemon", "grim", "magick", "tesseract",
+                  "wtype", "wl-paste", "node", "git"]
+
+
+def missing_tools():
+    return [tool for tool in REQUIRED_TOOLS if shutil.which(tool) is None]
+
+
+def tool_version(argv):
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return "unavailable"
+    return (result.stdout or result.stderr).strip().splitlines()[0] if (result.stdout or result.stderr).strip() else "unknown"
+
+
+def node_pins(checkout):
+    """Node versions CI or the repository pins: (file, version) pairs."""
+    pins = []
+    for name in [".nvmrc", ".node-version"]:
+        target = os.path.join(checkout, name)
+        if os.path.isfile(target):
+            pins.append((name, open(target).read().strip().lstrip("v")))
+    workflows = os.path.join(checkout, ".github", "workflows")
+    if os.path.isdir(workflows):
+        for name in sorted(os.listdir(workflows)):
+            if not name.endswith((".yml", ".yaml")):
+                continue
+            text = open(os.path.join(workflows, name)).read()
+            for match in re.finditer(r"node-version:\s*['\"]?([0-9][0-9.x]*)", text):
+                pins.append((f".github/workflows/{name}", match.group(1)))
+    return pins
+
+
+def version_matches(local, pin):
+    """A pin like 22 or 22.4 or 22.x matches any local version it prefixes."""
+    parts = [p for p in pin.split(".") if p not in ("x", "*", "")]
+    return local.split(".")[:len(parts)] == parts
+
+
+def toolchain_report(checkout):
+    local_node = tool_version(["node", "--version"]).lstrip("v")
+    pins = node_pins(checkout)
+    mismatches = [{"file": f, "pinned": v, "local": local_node} for f, v in pins if not version_matches(local_node, v)]
+    return {
+        "local": {"node": local_node, "quickshell": tool_version(["qs", "--version"]),
+                  "hyprland": tool_version(["Hyprland", "--version"]),
+                  "omarchy": tool_version(["omarchy", "version"])},
+        "pins": [{"file": f, "version": v} for f, v in pins],
+        "mismatches": mismatches,
+    }
+
+
+def doctor_checks(rec):
+    checks = []
+
+    def check(name, ok, detail=""):
+        checks.append({"check": name, "ok": bool(ok), "detail": detail})
+
+    for name in ["compositor", "bus", "shell"]:
+        pids = rec["pids"].get(name)
+        check(f"{name} sandbox running", pids and pid_alive(pids["init"]), json.dumps(pids))
+    outputs = monitor_names(rec) if rec.get("hypr_sig") else []
+    check("nested compositor has only the headless output", outputs == [HEADLESS_OUTPUT], str(outputs))
+    check("shell instance belongs to this run", rec.get("qs_id") and rec["qs_id"] not in host_qs_ids(),
+          str(rec.get("qs_id")))
+    link = os.path.join(rec["home"], ".config/omarchy/plugins", PLUGIN_ID)
+    check("plugin loads from the checkout under test", os.path.realpath(link) == rec["checkout"], link)
+    current = checkout_revision(rec["checkout"])
+    check("checkout revision unchanged since launch", current == rec["revision"],
+          f"launched {rec['revision']}, now {current}")
+    try:
+        status = ipc(rec, "status")
+    except Failure as error:
+        status = None
+        check("widget IPC answers", False, str(error))
+    else:
+        check("widget IPC answers", True, status)
+    calls = read_calls(rec)
+    check("the shell's mullvad is the stub", any(c["argv"][:3] == ["mullvad", "status", "--json"] for c in calls),
+          f"{len(calls)} stub calls recorded")
+    missing = missing_tools()
+    check("drive tools installed", not missing, ", ".join(missing) or "all present")
+    return checks, status
+
+
+def cmd_doctor(args):
+    if args.toolchain_only:
+        if not args.checkout:
+            die("--toolchain-only needs --checkout <path>")
+        return cmd_toolchain_only(args)
+    rec = load_record(args.run)
+    checks, status = doctor_checks(rec)
+    toolchain = toolchain_report(rec["checkout"])
+    for check in checks:
+        print(f"{'ok  ' if check['ok'] else 'FAIL'} {check['check']}: {check['detail']}")
+    print(f"toolchain: {json.dumps(toolchain['local'])}")
+    if not toolchain["pins"]:
+        print("toolchain: the checkout pins no node version (.nvmrc, .node-version, .github/workflows)")
+    for mismatch in toolchain["mismatches"]:
+        level = "FAIL" if args.strict_toolchain else "WARN"
+        print(f"{level} toolchain: {mismatch['file']} pins node {mismatch['pinned']}, this host has {mismatch['local']}")
+    write_evidence(rec, f"doctor-{now_id()}.json", {"checks": checks, "status": status, "toolchain": toolchain})
+    failed = [c for c in checks if not c["ok"]]
+    if failed or (args.strict_toolchain and toolchain["mismatches"]):
+        print("FAIL doctor")
+        return 1
+    print("ok doctor")
+    return 0
+
+
+# Input: keys and pointer, into the run's compositor only ------------------
+
+POINTER_REST = (60, 760)
+BUTTONS = {"left": 0x110, "right": 0x111, "middle": 0x112}
+
+
+def keys(rec, *names, text=None):
+    """Sends key names (wtype -k) or literal text to the focused surface of
+    this run's compositor. wtype gets this run's WAYLAND_DISPLAY and runtime
+    dir only, so it cannot reach the user's session."""
+    argv = ["wtype", "-d", "25"]
+    for name in names:
+        argv += ["-k", name]
+    if text is not None:
+        argv += ["--", text]
+    assert len(argv) > 3
+    run_client(rec, argv)
+    time.sleep(0.25)
+
+
+class Wire:
+    """Just enough of the Wayland wire protocol for zwlr_virtual_pointer_v1."""
+
+    def __init__(self, socket_path):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(5)
+        self.sock.connect(socket_path)
+        self.next_id = 2
+        self.pending = b""
+
+    def new_id(self):
+        self.next_id += 1
+        return self.next_id - 1
+
+    def send(self, obj, opcode, payload=b""):
+        self.sock.sendall(struct.pack("<II", obj, ((8 + len(payload)) << 16) | opcode) + payload)
+
+    def roundtrip(self, on_event=None):
+        """wl_display.sync, then reads events until its callback fires."""
+        callback = self.new_id()
+        self.send(1, 0, struct.pack("<I", callback))
+        for _ in range(100000):
+            while len(self.pending) >= 8:
+                obj, word = struct.unpack("<II", self.pending[:8])
+                size = word >> 16
+                if len(self.pending) < size:
+                    break
+                body, self.pending = self.pending[8:size], self.pending[size:]
+                if obj == callback:
+                    return
+                if obj == 1 and (word & 0xFFFF) == 0:
+                    raise Failure(f"wayland protocol error: {body!r}")
+                if on_event:
+                    on_event(obj, word & 0xFFFF, body)
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise Failure("compositor closed the virtual pointer connection")
+            self.pending += chunk
+        raise Failure("virtual pointer roundtrip did not finish")
+
+
+def wire_string(text):
+    data = text.encode() + b"\0"
+    return struct.pack("<I", len(data)) + data + b"\0" * (-len(data) % 4)
+
+
+def virtual_pointer(rec):
+    wire = Wire(os.path.join(rec["runtime"], rec["wayland"]))
+    registry = wire.new_id()
+    wire.send(1, 1, struct.pack("<I", registry))
+    found = {}
+
+    def on_global(obj, opcode, body):
+        if obj == registry and opcode == 0:
+            name, length = struct.unpack("<II", body[:8])
+            found[body[8:8 + length - 1].decode()] = name
+
+    wire.roundtrip(on_global)
+    interface = "zwlr_virtual_pointer_manager_v1"
+    if interface not in found:
+        raise Failure(f"the nested compositor offers no {interface}")
+    manager = wire.new_id()
+    wire.send(registry, 0, struct.pack("<I", found[interface]) + wire_string(interface) + struct.pack("<II", 1, manager))
+    pointer = wire.new_id()
+    wire.send(manager, 0, struct.pack("<II", 0, pointer))
+    return wire, pointer
+
+
+def pointer(rec, x, y, button=None):
+    """Moves the run's virtual pointer to (x, y) on the headless output and
+    optionally clicks a button there."""
+    width, height = output_size(rec)
+    assert 0 <= x < width and 0 <= y < height
+    wire, vp = virtual_pointer(rec)
+    stamp = int(time.monotonic() * 1000) & 0xFFFFFFFF
+    wire.send(vp, 1, struct.pack("<IIIII", stamp, int(x), int(y), width, height))
+    wire.send(vp, 4, struct.pack("<I", stamp))
+    wire.roundtrip()
+    if button is not None:
+        time.sleep(0.15)
+        for step, state in [(1, 1), (2, 0)]:
+            wire.send(vp, 2, struct.pack("<III", stamp + step, BUTTONS[button], state))
+            wire.send(vp, 4, struct.pack("<I", stamp + step))
+            wire.roundtrip()
+            time.sleep(0.05)
+    wire.send(vp, 8)
+    wire.roundtrip()
+    wire.sock.close()
+    time.sleep(0.3)
+
+
+def output_size(rec):
+    monitors = hyprctl_json(rec, "monitors") or []
+    assert monitors, "nested compositor reports no monitor"
+    return monitors[0]["width"], monitors[0]["height"]
+
+
+# Observation: screenshots, pixels, text ----------------------------------
+
+
+def screenshot(rec, target):
+    run_client(rec, ["grim", "-o", HEADLESS_OUTPUT, target])
+    assert os.path.getsize(target) > 0
+    return target
+
+
+def read_rgb(path, box):
+    """Returns (width, height, bytes) of box=(x, y, w, h) as 8-bit RGB."""
+    x, y, w, h = box
+    result = subprocess.run(["magick", path, "-crop", f"{w}x{h}+{x}+{y}", "+repage", "-depth", "8", "ppm:-"],
+                            capture_output=True, timeout=20, check=True)
+    data = result.stdout
+    fields = data.split(maxsplit=4)
+    assert fields[0] == b"P6"
+    width, height = int(fields[1]), int(fields[2])
+    pixels = fields[4][: width * height * 3]
+    assert len(pixels) == width * height * 3
+    return width, height, pixels
+
+
+def bar_height(rec):
+    layer = bar_layer(rec)
+    if not layer:
+        raise Failure("the bar's layer surface is not mapped")
+    return layer["h"]
+
+
+def icon_box(rec, shot):
+    """Finds the widget in the bar from pixels that differ from the bar's
+    background, without assuming what the glyph looks like."""
+    width, _ = output_size(rec)
+    height = bar_height(rec)
+    span = 160
+    w, h, pixels = read_rgb(shot, (width - span, 0, span, height))
+    background = pixels[0:3]
+    xs, ys = [], []
+    for index in range(w * h):
+        pixel = pixels[index * 3:index * 3 + 3]
+        if max(abs(pixel[c] - background[c]) for c in range(3)) > 24:
+            xs.append(index % w)
+            ys.append(index // w)
+    if not xs:
+        raise Failure("no widget pixels in the bar's right section")
+    cx = width - span + (min(xs) + max(xs)) // 2
+    cy = (min(ys) + max(ys)) // 2
+    half = max(14, height // 2)
+    return (max(0, cx - half), max(0, cy - half), 2 * half, min(2 * half, height)), (cx, cy)
+
+
+def pixel_stats(shot, box, background):
+    """Foreground pixel count, mean luma, and mean redness (R minus the mean
+    of G and B) over the whole box and its bottom-right quadrant."""
+    w, h, pixels = read_rgb(shot, box)
+    stats = {"all": [0, 0.0, 0.0], "badge": [0, 0.0, 0.0]}
+    for index in range(w * h):
+        r, g, b = pixels[index * 3:index * 3 + 3]
+        if max(abs(r - background[0]), abs(g - background[1]), abs(b - background[2])) <= 24:
+            continue
+        keys_ = ["all"] + (["badge"] if index % w >= w // 2 and index // w >= h // 2 else [])
+        for key in keys_:
+            stats[key][0] += 1
+            stats[key][1] += 0.299 * r + 0.587 * g + 0.114 * b
+            stats[key][2] += r - (g + b) / 2
+    return {k: {"pixels": n, "luma": round(l / n, 1) if n else 0.0, "redness": round(d / n, 1) if n else 0.0}
+            for k, (n, l, d) in stats.items()}
+
+
+def changed_pixels(shot_a, shot_b, box):
+    _, _, a = read_rgb(shot_a, box)
+    _, _, b = read_rgb(shot_b, box)
+    return sum(1 for i in range(0, len(a), 3) if max(abs(a[i + c] - b[i + c]) for c in range(3)) > 24)
+
+
+def ocr(rec, shot, tsv=False):
+    """Reads the panel side of the screen. The panel opens under the bar on
+    the right, so the right half below the bar holds all of its text."""
+    width, height = output_size(rec)
+    top = bar_height(rec)
+    prepared = shot[:-4] + ".ocr.png"
+    subprocess.run(["magick", shot, "-crop", f"{width // 2}x{height - top}+{width // 2}+{top}", "+repage",
+                    "-colorspace", "gray", "-negate", "-resize", "200%", prepared], check=True, timeout=30)
+    argv = ["tesseract", prepared, "-", "--psm", "4"] + (["tsv"] if tsv else [])
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=60, check=True)
+    os.remove(prepared)
+    return result.stdout, (width // 2, top)
+
+
+def normalize(text):
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def find_text(rec, shot, phrase):
+    """Screen box (x0, y0, x1, y1) of the first OCR line run spelling phrase."""
+    output, (left, top) = ocr(rec, shot, tsv=True)
+    lines = {}
+    for row in output.splitlines()[1:]:
+        cols = row.split("\t")
+        if len(cols) < 12 or not cols[11].strip():
+            continue
+        key = (cols[2], cols[3], cols[4])
+        lines.setdefault(key, []).append((cols[11], int(cols[6]), int(cols[7]), int(cols[8]), int(cols[9])))
+    wanted = normalize(phrase).split()
+    for words in lines.values():
+        tokens = [normalize(w[0]) for w in words]
+        for start in range(len(tokens) - len(wanted) + 1):
+            if tokens[start:start + len(wanted)] == wanted:
+                hit = words[start:start + len(wanted)]
+                # OCR ran on a 2x upscale of the crop at (left, top).
+                return (left + min(w[1] for w in hit) // 2, top + min(w[2] for w in hit) // 2,
+                        left + max(w[1] + w[3] for w in hit) // 2, top + max(w[2] + w[4] for w in hit) // 2)
+    raise Failure(f"OCR found no line containing {phrase!r}")
+
+
+def centre(box):
+    return (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
+
+
+def panel_open(rec):
+    layers = hyprctl_json(rec, "layers") or {}
+    return any(layer.get("namespace") == "omarchy-keyboard-panel"
+               for monitor in layers.values() for level in (monitor.get("levels") or {}).values() for layer in level)
+
+
+# Stub boundary: seed daemon state and read recorded calls ----------------
+
+
+def stub_path(rec, name):
+    return os.path.join(rec["dir"], "stub", name)
+
+
+def settings_path(rec):
+    return os.path.join(rec["dir"], "etc-mullvad", "settings.json")
+
+
+def read_calls(rec):
+    with open(stub_path(rec, "calls.jsonl")) as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+def read_settings(rec):
+    with open(settings_path(rec)) as handle:
+        return json.load(handle)
+
+
+def write_json_atomic(target, data):
+    tmp = target + ".tmp"
+    with open(tmp, "w") as handle:
+        json.dump(data, handle, indent=2)
+    os.replace(tmp, target)
+
+
+def seed(rec, state=None, settings=None):
+    """Puts the stub daemon into a known state, the way seed data would be:
+    the stub is the daemon, so this is the daemon's state, not the widget's."""
+    current = default_stub_state()
+    current.update(state or {})
+    with open(os.path.join(FIXTURES, "settings.json")) as handle:
+        base = json.load(handle)
+    if settings:
+        settings(base)
+    write_json_atomic(settings_path(rec), base)
+    write_json_atomic(stub_path(rec, "state.json"), current)
+
+
+# Drive framework ---------------------------------------------------------
+
+TEST_ACCOUNT = "1111222233334444"
+ACTION_SETTLE_S = 0.7  # The widget refuses a new action while the last one's process runs.
+
+
+class Drive:
+    """One feature's journey: steps, checks, and the evidence they leave."""
+
+    def __init__(self, rec, feature, out):
+        self.rec = rec
+        self.feature = feature
+        self.out = out
+        self.count = 0
+        self.log = []
+        self.consumed = len(read_calls(rec))
+        self.first_call = self.consumed
+        os.makedirs(out, exist_ok=True)
+
+    def note(self, what, ok=True, detail=""):
+        self.log.append({"step": what, "ok": ok, "detail": detail, "t": round(time.time(), 2)})
+
+    def check(self, ok, what, detail=""):
+        self.note(what, bool(ok), detail)
+        if not ok:
+            raise Failure(f"{what}{': ' + detail if detail else ''}")
+
+    def shot(self, label):
+        self.count += 1
+        target = os.path.join(self.out, f"{self.count:02d}-{label}.png")
+        screenshot(self.rec, target)
+        self.note(f"screenshot {os.path.basename(target)}")
+        return target
+
+    def read(self, label):
+        """Screenshot plus OCR of the panel side, saved beside it."""
+        target = self.shot(label)
+        text, _ = ocr(self.rec, target)
+        with open(target[:-4] + ".txt", "w") as handle:
+            handle.write(text)
+        return target, normalize(text)
+
+    def expect_text(self, label, present=(), absent=(), timeout_s=6):
+        """Waits until the panel shows every present phrase and none of the absent ones."""
+        last = {}
+
+        def ready():
+            last["shot"], last["text"] = self.read(label)
+            return all(normalize(p) in last["text"] for p in present) and \
+                not any(normalize(a) in last["text"] for a in absent)
+
+        try:
+            wait_until(ready, timeout_s, f"panel text {list(present)} without {list(absent)}", interval_s=0.3)
+        except Failure:
+            self.check(False, f"panel shows {list(present)} and not {list(absent)}", last.get("text", "")[:400])
+        self.note(f"panel shows {list(present)} and not {list(absent)}")
+        return last["shot"]
+
+    def status(self, expected, timeout_s=12):
+        try:
+            wait_until(lambda: ipc(self.rec, "status") == expected, timeout_s, f"status {expected!r}", 0.2)
+        except Failure:
+            self.check(False, f"IPC status is {expected!r}", f"got {ipc(self.rec, 'status')!r}")
+        self.note(f"IPC status is {expected!r}")
+
+    def take(self, argv, timeout_s=8):
+        """Waits for the stub to record argv after the last call already taken."""
+        def found():
+            calls = read_calls(self.rec)
+            for index in range(self.consumed, len(calls)):
+                if calls[index]["argv"] == argv:
+                    return index + 1
+            return 0
+
+        try:
+            self.consumed = wait_until(found, timeout_s, f"stub call {argv}")
+        except Failure:
+            recent = [c["argv"] for c in read_calls(self.rec)[self.consumed:]]
+            self.check(False, f"stub recorded {argv}", f"calls since last check: {recent}")
+        self.note(f"stub recorded {argv}")
+        time.sleep(ACTION_SETTLE_S)
+        return read_calls(self.rec)[self.consumed - 1]
+
+    def no_call(self, head, seconds=1.5, what=None):
+        time.sleep(seconds)
+        calls = [c["argv"] for c in read_calls(self.rec)[self.consumed:]]
+        self.check(not any(a[:len(head)] == head for a in calls), what or f"no stub call starting {head}",
+                   f"calls: {calls}")
+
+    def wait_settings(self, what, predicate, timeout_s=6):
+        try:
+            wait_until(lambda: predicate(read_settings(self.rec)), timeout_s, what)
+        except Failure:
+            self.check(False, f"settings.json shows {what}")
+        self.note(f"settings.json shows {what}")
+
+    def ipc(self, method):
+        result = ipc(self.rec, method)
+        self.note(f"ipc {method}", True, result)
+        return result
+
+    def keys(self, *names, text=None):
+        keys(self.rec, *names, text=text)
+        self.note(f"keys {list(names)}{' text ' + repr(text) if text is not None else ''}")
+
+    def click(self, point, button="left"):
+        pointer(self.rec, point[0], point[1], button)
+        self.note(f"{button} click at {point}")
+        pointer(self.rec, *POINTER_REST)
+
+    def panel(self, want_open, timeout_s=5):
+        try:
+            wait_until(lambda: panel_open(self.rec) == want_open, timeout_s, f"panel {'open' if want_open else 'closed'}")
+        except Failure:
+            self.check(False, f"panel is {'open' if want_open else 'closed'}")
+        self.note(f"panel is {'open' if want_open else 'closed'}")
+
+    def baseline(self, state=None, settings=None, expected="Disconnected"):
+        """Closes the panel and seeds the stub; the widget then refreshes the
+        way it does on its own timer, via the refresh IPC call."""
+        if panel_open(self.rec):
+            ipc(self.rec, "close")
+            self.panel(False)
+        seed(self.rec, state, settings)
+        ipc(self.rec, "refresh")
+        self.status(expected)
+        pointer(self.rec, *POINTER_REST)
+        self.consumed = len(read_calls(self.rec))
+        self.note(f"baseline {json.dumps(state or {})} -> {expected!r}")
+
+    def open_panel(self, collapse_dns=False):
+        self.ipc("open")
+        self.panel(True)
+        time.sleep(0.3)
+        if collapse_dns:
+            self.collapse_dns()
+
+    def collapse_dns(self):
+        """The panel keeps the DNS blocker list expanded across close and
+        open, and an expanded list shifts every row below it, so drives that
+        count rows start from the collapsed list."""
+        self.goto(row("dns"))
+        _, text = self.read("dns-state")
+        if "social media" in text or "trackers" in text:
+            self.keys("Return")
+            self.note("collapsed the DNS blocker list left expanded by an earlier run")
+
+    def goto(self, index):
+        """Moves the keyboard cursor to row `index` of the logged-in panel:
+        the first j only shows the cursor, k walks to the top, j walks down."""
+        self.keys("j", *(["k"] * 30))
+        if index:
+            self.keys(*(["j"] * index))
+
+    def finish(self):
+        calls = read_calls(self.rec)[self.first_call:]
+        write_json_atomic(os.path.join(self.out, "calls.json"), calls)
+        write_json_atomic(os.path.join(self.out, "steps.json"), self.log)
+
+
+def lockdown_on(settings):
+    settings["lockdown_mode"] = True
+
+
+# Feature drives ----------------------------------------------------------
+
+LOGGED_IN_ROWS = ["power", "location", "set:autoConnect", "set:lockdownMode", "set:allowLan", "set:multihop",
+                  "set:daita", "set:quantumResistant", "set:ipv6", "dns", "acct:copy", "acct:manage", "acct:logout"]
+
+
+def row(name):
+    return LOGGED_IN_ROWS.index(name)
+
+
+def drive_bar_icon(d):
+    """Icon states from the stub daemon's state, then each pointer entry point."""
+    states = [("active", {"tunnel": "connected"}, None, "Connected"),
+              ("off", {}, None, "Disconnected"),
+              ("warning", {"loggedIn": False}, None, "Not logged in"),
+              ("problem", {}, lockdown_on, "Lockdown is blocking traffic"),
+              ("daemon-down", {"daemon": False}, None, "Daemon is not running")]
+    shots = {}
+    for name, state, settings, expected in states:
+        d.baseline(state, settings, expected)
+        time.sleep(0.5)
+        shots[name] = d.shot("icon-" + name)
+    box, point = icon_box(d.rec, shots["active"])
+    _, _, background = read_rgb(shots["active"], (2, 2, 1, 1))
+    stats = {name: pixel_stats(shot, box, background) for name, shot in shots.items()}
+    write_json_atomic(os.path.join(d.out, "icon-stats.json"), {"box": box, "stats": stats})
+    d.check(changed_pixels(shots["active"], shots["off"], box) > 0, "off icon differs from active")
+    d.check(stats["off"]["all"]["luma"] < stats["active"]["all"]["luma"] - 10, "off icon is dimmed",
+            f"{stats['off']['all']} vs {stats['active']['all']}")
+    d.check(stats["warning"]["badge"]["redness"] > stats["off"]["badge"]["redness"] + 15,
+            "logged-out icon carries the warning badge", f"{stats['warning']['badge']} vs {stats['off']['badge']}")
+    d.check(stats["problem"]["all"]["redness"] > stats["active"]["all"]["redness"] + 15,
+            "blocking icon turns the urgent colour", f"{stats['problem']['all']} vs {stats['active']['all']}")
+    d.check(stats["daemon-down"]["badge"]["redness"] > stats["off"]["badge"]["redness"] + 15,
+            "daemon-down icon carries the warning badge")
+    d.baseline()
+    drive_bar_clicks(d, point)
+
+
+def drive_bar_clicks(d, point):
+    d.click(point, "left")
+    d.panel(True)
+    d.shot("left-click-open")
+    d.click(point, "left")
+    d.panel(False)
+    for method, want in [("open", True), ("close", False), ("toggle", True), ("toggle", False)]:
+        d.ipc(method)
+        d.panel(want)
+    d.click(point, "right")
+    d.take(["mullvad", "connect"])
+    d.status("Connected")
+    d.click(point, "middle")
+    d.take(["mullvad", "reconnect"])
+    d.status("Connected")
+    d.click(point, "right")
+    d.take(["mullvad", "disconnect"])
+    d.status("Disconnected")
+
+
+def drive_connection(d):
+    d.baseline()
+    for method, argv, expected in [("connect", ["mullvad", "connect"], "Connected"),
+                                   ("disconnect", ["mullvad", "disconnect"], "Disconnected"),
+                                   ("toggleConnection", ["mullvad", "connect"], "Connected"),
+                                   ("toggleConnection", ["mullvad", "disconnect"], "Disconnected")]:
+        d.ipc(method)
+        d.take(argv)
+        d.status(expected)
+    d.open_panel()
+    before = d.shot("panel-disconnected")
+    d.keys(text="c")
+    d.take(["mullvad", "connect"])
+    d.status("Connected")
+    after = d.shot("panel-connected")
+    d.keys(text="r")
+    d.take(["mullvad", "reconnect"])
+    d.keys(text="c")
+    d.take(["mullvad", "disconnect"])
+    d.status("Disconnected")
+    d.goto(row("power"))
+    d.keys("Return")
+    d.take(["mullvad", "connect"])
+    d.status("Connected")
+    d.keys("space")
+    d.take(["mullvad", "disconnect"])
+    d.status("Disconnected")
+    switch = power_switch(d, before, after)
+    d.click(switch)
+    d.take(["mullvad", "connect"])
+    d.status("Connected")
+    d.click(switch)
+    d.take(["mullvad", "disconnect"])
+    d.status("Disconnected")
+    drive_connection_refusals(d)
+
+
+def power_switch(d, disconnected_shot, connected_shot):
+    """The hero's switch: the pixels on the title's row, right of the title,
+    that change between the disconnected and connected panel."""
+    title = find_text(d.rec, disconnected_shot, "Mullvad VPN")
+    width, _ = output_size(d.rec)
+    band = (title[2] + 20, max(0, title[1] - 10), width - title[2] - 20, title[3] - title[1] + 20)
+    w, h, a = read_rgb(disconnected_shot, band)
+    _, _, b = read_rgb(connected_shot, band)
+    xs = [i // 3 % w for i in range(0, len(a), 3) if max(abs(a[i + c] - b[i + c]) for c in range(3)) > 24]
+    ys = [i // 3 // w for i in range(0, len(a), 3) if max(abs(a[i + c] - b[i + c]) for c in range(3)) > 24]
+    d.check(xs, "the power switch changes when the tunnel connects")
+    return band[0] + (min(xs) + max(xs)) // 2, band[1] + (min(ys) + max(ys)) // 2
+
+
+def drive_connection_refusals(d):
+    d.baseline({"loggedIn": False}, expected="Not logged in")
+    d.open_panel()
+    d.ipc("connect")
+    d.expect_text("refuse-logged-out", present=["Log in to a Mullvad account first"], timeout_s=2.5)
+    d.no_call(["mullvad", "connect"])
+    d.status("Not logged in")
+    d.baseline({"daemon": False}, expected="Daemon is not running")
+    d.open_panel()
+    d.expect_text("daemon-down", present=["Start mullvad-daemon"])
+    d.keys("j")
+    d.keys("Return")
+    d.take(["pkexec", "systemctl", "enable", "--now", "mullvad-daemon"])
+    d.baseline()
+
+
+def location_is(place):
+    return lambda s: s["relay_settings"]["normal"]["location"]["only"]["location"] == place
+
+
+def drive_location(d):
+    d.baseline()
+    d.open_panel()
+    d.goto(row("location"))
+    d.keys("Return")
+    d.expect_text("picker-from-row", present=["Search countries and cities", "Albania", "Germany", "Gothenburg"])
+    d.no_call(["mullvad", "relay"], 1.0)
+    d.keys("Down", "Down")
+    d.keys(text="l")
+    d.expect_text("expand-germany", present=["Berlin", "Dusseldorf", "Frankfurt"], absent=["Stockholm"])
+    d.keys(text="h")
+    d.expect_text("collapse-germany", present=["Germany"], absent=["Berlin"])
+    d.keys("Escape")
+    d.expect_text("picker-closed", present=["Change location"], absent=["Search countries"])
+    d.panel(True)
+    d.keys(text="/")
+    target = find_text(d.rec, d.expect_text("picker-from-slash", present=["Albania"]), "Albania")
+    d.click(centre(target))
+    d.take(["mullvad", "relay", "set", "location", "al"])
+    d.take(["mullvad", "connect"])
+    d.status("Connected")
+    d.wait_settings("location al", location_is({"country": "al"}))
+    d.expect_text("chosen-albania", present=["Tirana, Albania"], absent=["Search countries"])
+    d.keys(text="/")
+    d.expect_text("search-escape-before", present=["Search countries and cities"])
+    d.keys("Escape")
+    d.expect_text("search-escape-after", present=["Change location"], absent=["Search countries"])
+    d.keys(text="/")
+    d.keys(text="stock")
+    d.expect_text("search-stock", present=["Stockholm"], absent=["Albania Tirana", "Germany"])
+    d.keys("Return")
+    d.take(["mullvad", "relay", "set", "location", "se", "sto"])
+    d.no_call(["mullvad", "connect"], 1.0)
+    d.wait_settings("location se/sto", location_is({"country": "se", "city": "sto"}))
+    d.expect_text("chosen-stockholm", present=["Stockholm, Sweden"], absent=["Search countries"])
+    # Return on the Location row must open the picker and choose nothing,
+    # also right after a pick from a search.
+    d.keys("Return")
+    d.expect_text("picker-after-search-pick", present=["Search countries and cities"])
+    d.no_call(["mullvad", "relay"], 1.5,
+              what="Return on the Location row after a search pick opens the picker without choosing a location")
+    d.baseline()
+
+
+SETTING_ROWS = [  # (row, on command, off command, settings.json probe)
+    ("set:autoConnect", ["mullvad", "auto-connect", "set", "on"], ["mullvad", "auto-connect", "set", "off"],
+     lambda s: s["auto_connect"]),
+    ("set:lockdownMode", ["mullvad", "lockdown-mode", "set", "on"], ["mullvad", "lockdown-mode", "set", "off"],
+     lambda s: s["lockdown_mode"]),
+    ("set:allowLan", ["mullvad", "lan", "set", "allow"], ["mullvad", "lan", "set", "block"],
+     lambda s: s["allow_lan"]),
+    ("set:multihop", ["mullvad", "relay", "set", "multihop", "on"], ["mullvad", "relay", "set", "multihop", "off"],
+     lambda s: s["relay_settings"]["normal"]["wireguard_constraints"]["use_multihop"]),
+    ("set:daita", ["mullvad", "tunnel", "set", "daita", "on"], ["mullvad", "tunnel", "set", "daita", "off"],
+     lambda s: s["tunnel_options"]["wireguard"]["daita"]["enabled"]),
+    ("set:quantumResistant", ["mullvad", "tunnel", "set", "quantum-resistant", "on"],
+     ["mullvad", "tunnel", "set", "quantum-resistant", "off"],
+     lambda s: s["tunnel_options"]["wireguard"]["quantum_resistant"] == "on"),
+    ("set:ipv6", ["mullvad", "tunnel", "set", "ipv6", "on"], ["mullvad", "tunnel", "set", "ipv6", "off"],
+     lambda s: s["tunnel_options"]["generic"]["enable_ipv6"]),
+]
+
+
+def drive_settings(d):
+    d.baseline()
+    d.open_panel(collapse_dns=True)
+    for name, on, off, probe in SETTING_ROWS:
+        initially = probe(read_settings(d.rec))
+        d.goto(row(name))
+        for key, argv, want in [("Return", off if initially else on, not initially),
+                                ("space", on if initially else off, initially)]:
+            d.keys(key)
+            d.take(argv)
+            d.wait_settings(f"{name} {'on' if want else 'off'}", lambda s, p=probe, w=want: p(s) == w)
+            if name == "set:lockdownMode" and want:
+                d.status("Lockdown is blocking traffic")
+            time.sleep(0.4)
+    d.shot("settings-restored")
+    drive_dns(d)
+    multihop = find_text(d.rec, d.shot("before-click-multihop"), "Multihop")
+    d.click(centre(multihop))
+    d.take(["mullvad", "relay", "set", "multihop", "on"])
+    d.expect_text("multihop-on", present=["Exit location", "multihop on"])
+    d.click(centre(multihop))
+    d.take(["mullvad", "relay", "set", "multihop", "off"])
+    d.baseline()
+
+
+def drive_dns(d):
+    d.goto(row("dns"))
+    d.keys("Return")
+    # The panel scrolls; walking the cursor to the last blocker brings them all into view.
+    d.keys(*(["j"] * 6))
+    d.expect_text("dns-expanded", present=["Ads", "Trackers", "Malware", "Gambling", "Adult content", "Social media"])
+    d.keys(*(["k"] * 4))
+    d.keys("Return")
+    d.take(["mullvad", "dns", "set", "default", "--block-ads", "--block-trackers"])
+    d.wait_settings("trackers blocked", lambda s: s["tunnel_options"]["dns_options"]["default_options"]["block_trackers"])
+    time.sleep(0.4)
+    d.keys("Return")
+    d.take(["mullvad", "dns", "set", "default", "--block-ads"])
+    d.keys("k", "k")
+    d.keys("Return")
+    d.expect_text("dns-collapsed", present=["DNS content blockers", "1 on"], absent=["Social media"])
+    ipc(d.rec, "close")
+    d.panel(False)
+    d.baseline(settings=lambda s: s["tunnel_options"]["dns_options"].__setitem__("state", "custom"))
+    d.open_panel()
+    d.expect_text("custom-dns", present=["Custom DNS is set"])
+    d.goto(row("dns"))
+    d.keys("Return")
+    d.keys("j")
+    d.keys("Return")
+    d.no_call(["mullvad", "dns"])
+    d.keys("k")
+    d.keys("Return")
+    d.baseline()
+    d.open_panel(collapse_dns=True)
+
+
+def drive_account(d):
+    d.baseline({"loggedIn": False}, expected="Not logged in")
+    d.open_panel()
+    d.expect_text("logged-out", present=["LOG IN", "Create a new account"])
+    d.keys(text="1111 2222 3333 4444")
+    d.keys("Return")
+    login = d.take(["mullvad", "account", "login"])
+    d.check(login.get("stdinIsTestAccount") is True, "the account number reached mullvad over stdin", json.dumps(login))
+    d.status("Disconnected")
+    d.collapse_dns()
+    leaked = [c["argv"] for c in read_calls(d.rec) if any(re.search(r"1111\s?2222", a) for a in c["argv"])]
+    d.check(not leaked, "no recorded argv holds the account number", str(leaked))
+    d.goto(row("acct:copy"))
+    d.expect_text("logged-in", present=["4444", "ACCOUNT", "Verify Mole"], absent=["1111"])
+    d.keys("Return")
+    d.expect_text("copied", present=["Account number copied"], timeout_s=2.5)
+    pasted = run_client(d.rec, ["wl-paste", "--no-newline"]).stdout
+    d.check(pasted == TEST_ACCOUNT, "the clipboard holds the account number", f"{len(pasted)} characters")
+    d.goto(row("acct:manage"))
+    d.keys("Return")
+    d.take(["omarchy-launch-browser", "https://mullvad.net/account"])
+    d.goto(row("acct:logout"))
+    d.keys("Return")
+    d.expect_text("logout-confirm", present=["Press again to log out"], timeout_s=2.5)
+    d.no_call(["mullvad", "account", "logout"], 0.5)
+    d.keys("Return")
+    d.take(["mullvad", "disconnect"])
+    d.take(["mullvad", "account", "logout"])
+    d.status("Not logged in")
+    drive_account_create_and_recovery(d)
+
+
+def drive_account_create_and_recovery(d):
+    d.baseline({"loggedIn": False}, expected="Not logged in")
+    d.open_panel()
+    d.keys("Down", "Down")
+    d.keys("Return")
+    d.expect_text("create-confirm", present=["Press again to create an account"], timeout_s=2.5)
+    d.no_call(["mullvad", "account", "create"], 0.5)
+    d.keys("Return")
+    d.take(["mullvad", "account", "create"])
+    d.status("Disconnected")
+    d.baseline({"loggedIn": False}, lockdown_on, expected="Lockdown is blocking traffic")
+    d.open_panel()
+    d.expect_text("recovery-lockdown", present=["Lockdown mode", "LOG IN"])
+    d.keys("Up")
+    d.keys("Return")
+    d.take(["mullvad", "lockdown-mode", "set", "off"])
+    d.status("Not logged in")
+    d.baseline({"loggedIn": False, "tunnel": "error"}, expected="Error · blocking all traffic")
+    d.open_panel()
+    d.expect_text("recovery-blocked", present=["Stop the tunnel so traffic flows again", "LOG IN"])
+    d.keys("Up")
+    d.keys("Return")
+    d.take(["mullvad", "disconnect"])
+    d.status("Not logged in")
+    d.baseline()
+
+
+DRIVES = {"bar-icon": drive_bar_icon, "connection": drive_connection, "location": drive_location,
+          "settings": drive_settings, "account": drive_account}
+
+
+# Commands ----------------------------------------------------------------
+
+
+def next_attempt_dir(rec, feature):
+    root = os.path.join(rec["evidence"], feature)
+    os.makedirs(root, exist_ok=True)
+    taken = [int(n) for n in os.listdir(root) if n.isdigit()]
+    target = os.path.join(root, str(max(taken, default=0) + 1))
+    os.makedirs(target)
+    return target
+
+
+def drive_once(rec, feature):
+    """Runs one feature's journey; returns (outcome, detail, evidence dir)."""
+    missing = missing_tools()
+    if missing:
+        return "SKIP", "missing tools: " + ", ".join(missing), None
+    out = next_attempt_dir(rec, feature)
+    drive = Drive(rec, feature, out)
+    try:
+        DRIVES[feature](drive)
+        outcome, detail = "PASS", ""
+    except Failure as error:
+        outcome, detail = "FAIL", str(error)
+        try:
+            drive.shot("failure")
+        except (Failure, subprocess.SubprocessError, OSError):
+            pass
+    except (subprocess.SubprocessError, OSError) as error:
+        outcome, detail = "FAIL", f"harness error: {error}"
+    drive.finish()
+    write_json_atomic(os.path.join(out, "result.json"), {"feature": feature, "outcome": outcome, "detail": detail,
+                                                         "revision": rec["revision"]})
+    return outcome, detail, out
+
+
+def result_line(outcome, feature, detail):
+    return f"{outcome} {feature}" + (f": {detail}" if detail else "")
+
+
+def cmd_drive(args):
+    rec = load_record(args.run)
+    repeat = args.repeat
+    assert repeat >= 1
+    results = []
+    for attempt in range(repeat):
+        outcome, detail, out = drive_once(rec, args.feature)
+        results.append((outcome, detail, out))
+        if repeat > 1:
+            print(f"run {attempt + 1}/{repeat}: {result_line(outcome, args.feature, detail)} evidence={out}")
+        if outcome == "SKIP":
+            break
+    outcome, detail, out = results[-1]
+    if repeat > 1:
+        passed = sum(1 for r in results if r[0] == "PASS")
+        failures = [f"run {i + 1} stopped at {r[1]}" for i, r in enumerate(results) if r[0] == "FAIL"]
+        print(f"repeat: {passed} of {repeat} passed" + (f"; {'; '.join(failures)}" if failures else ""))
+        if outcome != "SKIP":
+            outcome = "PASS" if passed == repeat else "FAIL"
+            detail = "" if passed == repeat else f"{passed} of {repeat} runs passed"
+    else:
+        print(f"evidence={out}")
+    print(result_line(outcome, args.feature, detail))
+    return 0 if outcome in ("PASS", "SKIP") else 1
+
+
+def cmd_all(args):
+    launch_args = argparse.Namespace(checkout=args.checkout, allow_host_window=args.allow_host_window,
+                                     host_display=args.host_display, evidence_root=args.evidence_root)
+    counts = {"PASS": 0, "FAIL": 0, "SKIP": 0}
+    if cmd_launch(launch_args) != 0:
+        run_id = latest_run_id()
+        print(f"all: 0 passed, {len(FEATURES)} failed, 0 skipped (launch failed)")
+        if run_id:
+            cmd_cleanup(argparse.Namespace(run=run_id))
+        return 1
+    rec = load_record(None)
+    try:
+        doctor_ok = cmd_doctor(argparse.Namespace(run=rec["id"], strict_toolchain=args.strict_toolchain,
+                                                  checkout=None, toolchain_only=False)) == 0
+        for feature in FEATURES:
+            if not doctor_ok:
+                outcome, detail = "FAIL", "doctor failed; instance not worth driving"
+            else:
+                outcome, detail, _ = drive_once(rec, feature)
+            counts[outcome] += 1
+            print(result_line(outcome, feature, detail))
+    finally:
+        cleaned = cmd_cleanup(argparse.Namespace(run=rec["id"])) == 0
+    print(f"all: {counts['PASS']} passed, {counts['FAIL']} failed, {counts['SKIP']} skipped"
+          + ("" if cleaned else "; cleanup FAILED"))
+    print(f"evidence={rec['evidence']}")
+    return 0 if counts["FAIL"] == 0 and cleaned else 1
+
+
+def latest_run_id():
+    if not os.path.isdir(RUNS_DIR):
+        return None
+    runs = sorted(f[:-5] for f in os.listdir(RUNS_DIR) if f.endswith(".json"))
+    return runs[-1] if runs else None
+
+
+def cmd_test(args):
+    checkout = os.path.realpath(args.checkout)
+    suite = os.path.join(checkout, "tests", "model.test.js")
+    if not os.path.isfile(suite):
+        die(f"{suite} not found; pass the plugin checkout with --checkout")
+    if args.filter:
+        die("tests/model.test.js calls its test functions directly and has no filter; run `test` without --filter")
+    with open(suite) as handle:
+        names = re.findall(r"^(test\w+)\(\)\s*$", handle.read(), re.MULTILINE)
+    result = subprocess.run(["node", suite], cwd=checkout, capture_output=True, text=True, timeout=120)
+    sys.stdout.write(result.stdout)
+    sys.stderr.write(result.stderr)
+    if result.returncode != 0 or not names:
+        print(f"FAIL test: node exited {result.returncode}; {len(names)} test functions called")
+        return 1
+    print(f"PASS test: tests/model.test.js ran {len(names)} test functions: {', '.join(names)}")
+    return 0
+
+
+FEATURE_SECTIONS = ["Sub-features", "How to get to it (user POV)", "Driving it with verify-omarchy-mullvad", "Gotchas"]
+
+
+def cmd_map_check(_args):
+    features_dir = os.path.join(os.path.dirname(SCRIPTS), "features")
+    with open(os.path.join(features_dir, "README.md")) as handle:
+        listed = re.findall(r"\]\(\./([a-z0-9-]+)\.md\)", handle.read())
+    files = sorted(f[:-3] for f in os.listdir(features_dir) if f.endswith(".md") and f != "README.md")
+    problems = []
+    problems += [f"{name}.md is listed in README.md but missing" for name in listed if name not in files]
+    problems += [f"{name}.md is not listed in README.md" for name in files if name not in listed]
+    for name in files:
+        problems += feature_file_problems(features_dir, name)
+    problems += [f"control CLI drives {f} but features/{f}.md does not exist" for f in DRIVES if f not in files]
+    problems += [f"features/{f}.md has no drive target in the control CLI" for f in files if f not in DRIVES]
+    for problem in problems:
+        print(f"FAIL map: {problem}")
+    print(f"map: {len(files)} feature files, {len(DRIVES)} drive targets, {len(problems)} problems")
+    return 0 if not problems else 1
+
+
+def feature_file_problems(features_dir, name):
+    with open(os.path.join(features_dir, name + ".md")) as handle:
+        text = handle.read()
+    problems = []
+    if not re.match(r"# \S", text):
+        problems.append(f"{name}.md does not start with an H1")
+    sections = re.findall(r"^## (.+)$", text, re.MULTILINE)
+    if sections != FEATURE_SECTIONS:
+        problems.append(f"{name}.md sections are {sections}, expected {FEATURE_SECTIONS}")
+    target = f"`verify-omarchy-mullvad drive {name}`"
+    driving = text.split("## Driving it with", 1)[-1]
+    after = driving.split("Preconditions:", 1)[-1].lstrip()
+    if "Preconditions:" not in driving or not after.startswith("- Drive target: " + target):
+        problems.append(f"{name}.md does not name {target} as the first precondition")
+    return problems
+
+
+def cmd_toolchain_only(args):
+    report = toolchain_report(os.path.realpath(args.checkout))
+    print(f"toolchain: {json.dumps(report['local'])}")
+    if not report["pins"]:
+        print("toolchain: the checkout pins no node version (.nvmrc, .node-version, .github/workflows)")
+    for mismatch in report["mismatches"]:
+        level = "FAIL" if args.strict_toolchain else "WARN"
+        print(f"{level} toolchain: {mismatch['file']} pins node {mismatch['pinned']}, this host has {mismatch['local']}")
+    if args.strict_toolchain and report["mismatches"]:
+        print("FAIL doctor")
+        return 1
+    print("ok doctor (toolchain only)")
+    return 0
+
+
+def cmd_keys(args):
+    keys(load_record(args.run), *args.key, text=args.text)
+    return 0
+
+
+def cmd_click(args):
+    rec = load_record(args.run)
+    if args.icon:
+        target = os.path.join(rec["dir"], "click-probe.png")
+        _, point = icon_box(rec, screenshot(rec, target))
+        os.remove(target)
+    elif args.text:
+        target = os.path.join(rec["dir"], "click-probe.png")
+        point = centre(find_text(rec, screenshot(rec, target), args.text))
+        os.remove(target)
+    else:
+        point = (args.x, args.y)
+    pointer(rec, point[0], point[1], args.button)
+    pointer(rec, *POINTER_REST)
+    print(f"{args.button} click at {point}")
+    return 0
+
+
+def cmd_shot(args):
+    rec = load_record(args.run)
+    target = args.path or os.path.join(rec["evidence"], f"shot-{now_id()}.png")
+    screenshot(rec, target)
+    print(target)
+    if args.ocr:
+        print(ocr(rec, target)[0])
+    return 0
+
+
+def cmd_calls(args):
+    for call in read_calls(load_record(args.run))[-args.last:]:
+        print(json.dumps(call))
+    return 0
+
+
+EXAMPLES = {
+    "launch": "verify-omarchy-mullvad launch --checkout ~/Projects/omarchy-mullvad --allow-host-window\n"
+              "  verify-omarchy-mullvad launch --checkout /path/to/pr-worktree --allow-host-window "
+              "--evidence-root /tmp/evidence",
+    "doctor": "verify-omarchy-mullvad doctor\n  verify-omarchy-mullvad doctor --run 20261020-210623-5791 "
+              "--strict-toolchain\n  verify-omarchy-mullvad doctor --toolchain-only --checkout /tmp/copy",
+    "drive": "verify-omarchy-mullvad drive bar-icon\n  verify-omarchy-mullvad drive connection\n"
+             "  verify-omarchy-mullvad drive location\n  verify-omarchy-mullvad drive settings\n"
+             "  verify-omarchy-mullvad drive account --repeat 3",
+    "all": "verify-omarchy-mullvad all --checkout ~/Projects/omarchy-mullvad --allow-host-window",
+    "cleanup": "verify-omarchy-mullvad cleanup\n  verify-omarchy-mullvad cleanup --run 20261020-210623-5791",
+    "test": "verify-omarchy-mullvad test --checkout ~/Projects/omarchy-mullvad",
+    "map-check": "verify-omarchy-mullvad map-check",
+    "ipc": "verify-omarchy-mullvad ipc status\n  verify-omarchy-mullvad ipc open",
+    "keys": "verify-omarchy-mullvad keys j j Return\n  verify-omarchy-mullvad keys --text /",
+    "click": "verify-omarchy-mullvad click --icon --button right\n  verify-omarchy-mullvad click --text Albania\n"
+             "  verify-omarchy-mullvad click --x 1240 --y 13",
+    "shot": "verify-omarchy-mullvad shot --ocr\n  verify-omarchy-mullvad shot --path /tmp/panel.png",
+    "calls": "verify-omarchy-mullvad calls --last 5",
+}
+
+
+def add(sub, name, help_text):
+    return sub.add_parser(name, help=help_text, description=help_text,
+                          epilog="examples:\n  " + EXAMPLES[name], formatter_class=argparse.RawDescriptionHelpFormatter)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog=SKILL, description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+                                     epilog="examples:\n  " + EXAMPLES["all"] + "\n  " + EXAMPLES["launch"].split("\n")[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+    launch = add(sub, "launch", "Start a private nested Hyprland and Omarchy shell with the plugin from --checkout.")
+    every = add(sub, "all", "Launch, doctor, drive every feature, and clean up, even after a failure.")
+    for p in (launch, every):
+        p.add_argument("--checkout", required=True, help="plugin checkout to load (a PR worktree or main)")
+        p.add_argument("--allow-host-window", action="store_true",
+                       help="accept a nested Hyprland window on your desktop for well under a second at start")
+        p.add_argument("--host-display", help="host Wayland socket (default: $WAYLAND_DISPLAY)")
+        p.add_argument("--evidence-root", help=f"evidence parent directory (default: {EVIDENCE_ROOT_DEFAULT})")
+    every.add_argument("--strict-toolchain", action="store_true", help="fail Doctor on a toolchain pin mismatch")
+    doctor = add(sub, "doctor", "Check that the run's instance is worth driving and compare toolchain pins.")
+    doctor.add_argument("--strict-toolchain", action="store_true", help="fail on a toolchain pin mismatch")
+    doctor.add_argument("--toolchain-only", action="store_true", help="only compare --checkout's pins with this host")
+    doctor.add_argument("--checkout", help="checkout for --toolchain-only")
+    drive = add(sub, "drive", "Drive one mapped feature; ends with PASS, FAIL, or SKIP.")
+    drive.add_argument("feature", choices=FEATURES)
+    drive.add_argument("--repeat", type=int, default=1, help="run the drive N times, each with its own evidence")
+    add(sub, "cleanup", "Stop this run's processes by recorded PID and delete its scratch state; keep evidence.")
+    test = add(sub, "test", "Run the repository's node tests for --checkout.")
+    test.add_argument("--checkout", required=True)
+    test.add_argument("--filter", help="not supported by tests/model.test.js; refused with an explanation")
+    add(sub, "map-check", "Check features/ against README.md and the control CLI's drive targets.")
+    call = add(sub, "ipc", "Call one of the widget's IPC functions in this run's shell.")
+    call.add_argument("method", choices=["open", "close", "toggle", "refresh", "connect", "disconnect",
+                                         "toggleConnection", "status"])
+    press = add(sub, "keys", "Send key names or text to this run's compositor.")
+    press.add_argument("key", nargs="*", help="key names as wtype -k takes them (j, Return, Escape, Down)")
+    press.add_argument("--text", help="literal text to type")
+    click = add(sub, "click", "Click in this run's compositor with its virtual pointer.")
+    click.add_argument("--icon", action="store_true", help="click the widget's bar icon")
+    click.add_argument("--text", help="click the panel line OCR reads as this text")
+    click.add_argument("--x", type=int)
+    click.add_argument("--y", type=int)
+    click.add_argument("--button", choices=list(BUTTONS), default="left")
+    shot = add(sub, "shot", "Screenshot this run's output into the evidence directory.")
+    shot.add_argument("--path")
+    shot.add_argument("--ocr", action="store_true", help="also print OCR of the panel side")
+    calls = add(sub, "calls", "Print the stub's recorded calls.")
+    calls.add_argument("--last", type=int, default=20)
+    for name, p in sub.choices.items():
+        if name not in ("launch", "all", "test", "map-check"):
+            p.add_argument("--run", help="run id (default: the most recent launched run)")
+    return parser
+
+
+COMMANDS = {"launch": cmd_launch, "all": cmd_all, "doctor": cmd_doctor, "drive": cmd_drive, "cleanup": cmd_cleanup,
+            "test": cmd_test, "map-check": cmd_map_check, "ipc": lambda a: print(ipc(load_record(a.run), a.method)) or 0,
+            "keys": cmd_keys, "click": cmd_click, "shot": cmd_shot, "calls": cmd_calls}
+
+
+def main():
+    args = build_parser().parse_args()
+    if args.command == "click" and not (args.icon or args.text or (args.x is not None and args.y is not None)):
+        die("click needs --icon, --text <phrase>, or --x and --y")
+    try:
+        return COMMANDS[args.command](args)
+    except Failure as error:
+        print(f"FAIL {args.command}: {error}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

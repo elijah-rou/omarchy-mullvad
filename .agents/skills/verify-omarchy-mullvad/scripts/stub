@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""Stand-in for the external boundaries the widget calls, chosen by argv[0]:
+
+- `mullvad`: the Mullvad CLI, the widget's only path to mullvad-daemon.
+  It models the daemon from a state file and the settings.json it serves.
+- `pkexec`, `omarchy-launch-browser`: record their argv and exit 0.
+
+Every invocation appends one JSON line to $STUB_DIR/calls.jsonl, so a drive
+proves a side effect from the recorded argv. The control CLI installs this
+file as symlinks in the run's bin directory, first on PATH for the shell it
+starts. It never runs the real mullvad binary.
+"""
+
+import datetime
+import json
+import os
+import sys
+import time
+
+STUB_DIR = os.environ.get("STUB_DIR", "")
+SETTINGS = os.environ.get("STUB_SETTINGS", "")
+RELAYS = os.environ.get("STUB_RELAYS") or os.path.join(os.path.dirname(os.path.realpath(__file__)), "fixtures", "relay-list.txt")
+
+# A clearly fake account number; evidence may contain it.
+TEST_ACCOUNT = "1111222233334444"
+
+
+def fail(message, code=1):
+    sys.stderr.write(message + "\n")
+    sys.exit(code)
+
+
+if not STUB_DIR or not os.path.isdir(STUB_DIR):
+    fail("stub: STUB_DIR is not set; run it through verify-omarchy-mullvad launch", 97)
+
+
+def path(name):
+    return os.path.join(STUB_DIR, name)
+
+
+def write_json_atomic(target, data):
+    # The daemon replaces settings.json rather than rewriting it; do the same
+    # so the widget's FileView sees the same kind of change.
+    tmp = target + ".tmp"
+    with open(tmp, "w") as handle:
+        json.dump(data, handle, indent=2)
+        handle.write("\n")
+    os.replace(tmp, target)
+
+
+def record(argv, extra=None):
+    entry = {"t": round(time.time(), 3), "argv": argv}
+    if extra:
+        entry.update(extra)
+    with open(path("calls.jsonl"), "a") as handle:
+        handle.write(json.dumps(entry) + "\n")
+
+
+def load_state():
+    with open(path("state.json")) as handle:
+        return json.load(handle)
+
+
+def save_state(state):
+    write_json_atomic(path("state.json"), state)
+
+
+def load_settings():
+    with open(SETTINGS) as handle:
+        return json.load(handle)
+
+
+def save_settings(settings):
+    write_json_atomic(SETTINGS, settings)
+
+
+def status_json(state):
+    settings = load_settings()
+    locked = settings.get("lockdown_mode") is True
+    tunnel = state["tunnel"]
+    if tunnel == "error":
+        details = {"cause": state.get("errorCause") or {"reason": "auth_failed", "details": "invalid_account"},
+                   "block_failure": state.get("blockFailure")}
+    else:
+        connected = tunnel in ("connected", "connecting")
+        location = settings["relay_settings"]["normal"]["location"]
+        place = (location.get("only") or {}).get("location") or {}
+        city, country, host = {
+            ("se", "got"): ("Gothenburg", "Sweden", "se-got-wg-001"),
+            ("se", "sto"): ("Stockholm", "Sweden", "se-sto-wg-001"),
+            ("de", "ber"): ("Berlin", "Germany", "de-ber-wg-001"),
+            ("de", "fra"): ("Frankfurt", "Germany", "de-fra-wg-001"),
+        }.get((place.get("country"), place.get("city")), ("Tirana", "Albania", "al-tia-wg-001"))
+        if not connected:
+            # Disconnected, the daemon reports where the machine appears from.
+            city, country, host = "Testville", "Testland", None
+        details = {
+            "location": {
+                "latitude": 0.0, "longitude": 0.0,
+                "ipv4": "192.0.2.10" if connected else "203.0.113.7",
+                "ipv6": None, "mullvad_exit_ip": connected, "hostname": host,
+                "city": city, "country": country,
+                "entry_hostname": None, "entry_city": None, "entry_country": None,
+            },
+            "locked_down": locked,
+        }
+    return json.dumps({"state": tunnel, "details": details}, separators=(",", ":"))
+
+
+def require_daemon(state):
+    if not state.get("daemon", True):
+        fail("Error: Failed to connect to mullvad-daemon")
+
+
+def transition(state, through, to):
+    state["tunnel"] = through
+    save_state(state)
+    time.sleep(0.4)
+    state = load_state()
+    state["tunnel"] = to
+    save_state(state)
+
+
+def cmd_status(args, state):
+    if "listen" not in args:
+        print(status_json(state))
+        return
+    last = None
+    while True:
+        try:
+            current = load_state()
+            stamp = (os.stat(path("state.json")).st_mtime_ns, os.stat(SETTINGS).st_mtime_ns)
+        except (OSError, ValueError):
+            time.sleep(0.05)
+            continue
+        if not current.get("daemon", True):
+            sys.stdout.flush()
+            fail("Error: Failed to connect to mullvad-daemon")
+        if stamp != last:
+            last = stamp
+            print(status_json(current), flush=True)
+        time.sleep(0.1)
+
+
+def expiry_text():
+    expires = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30, hours=6)
+    return expires.strftime("%Y-%m-%d %H:%M:%S +00:00")
+
+
+def cmd_account(args, state):
+    sub = args[0] if args else ""
+    if sub == "get":
+        if not state["loggedIn"]:
+            print("Not logged in on any account")
+            return
+        print(f"Mullvad account:    {state['account']}")
+        print(f"Expires at:         {expiry_text()}")
+        print(f"Device name:        {state['device']}")
+        return
+    if sub == "login":
+        # The widget passes the number over stdin; argv must not hold it.
+        number = sys.stdin.readline().strip()
+        record(["mullvad", "account", "login"], {"stdinIsTestAccount": number == TEST_ACCOUNT,
+                                                 "stdinDigits": len(number)})
+        if number != TEST_ACCOUNT:
+            fail("Error: Invalid account number")
+        state.update(loggedIn=True, account=number)
+        save_state(state)
+        return
+    if sub == "logout":
+        state.update(loggedIn=False)
+        save_state(state)
+        return
+    if sub == "create":
+        state.update(loggedIn=True, account=TEST_ACCOUNT)
+        save_state(state)
+        print(f"New account created: {TEST_ACCOUNT}")
+        return
+    fail(f"stub: unsupported account command {args}", 2)
+
+
+def set_flag(settings, args):
+    key = tuple(args[:-1])
+    value = args[-1]
+    on = value in ("on", "allow")
+    wg = settings["relay_settings"]["normal"]["wireguard_constraints"]
+    tunnel = settings["tunnel_options"]
+    targets = {
+        ("auto-connect", "set"): lambda: settings.__setitem__("auto_connect", on),
+        ("lockdown-mode", "set"): lambda: settings.__setitem__("lockdown_mode", on),
+        ("lan", "set"): lambda: settings.__setitem__("allow_lan", on),
+        ("relay", "set", "multihop"): lambda: wg.__setitem__("use_multihop", on),
+        ("tunnel", "set", "quantum-resistant"): lambda: tunnel["wireguard"].__setitem__("quantum_resistant", value),
+        ("tunnel", "set", "daita"): lambda: tunnel["wireguard"]["daita"].__setitem__("enabled", on),
+        ("tunnel", "set", "ipv6"): lambda: tunnel["generic"].__setitem__("enable_ipv6", on),
+    }
+    if key not in targets:
+        return False
+    targets[key]()
+    return True
+
+
+def main():
+    name = os.path.basename(sys.argv[0])
+    args = sys.argv[1:]
+    if name != "mullvad":
+        record([name] + args)
+        return
+    if args[:2] != ["account", "login"]:
+        record(["mullvad"] + args)
+    state = load_state()
+    if args[:1] == ["version"]:
+        print("Current version       : 2026.5-stub")
+        return
+    require_daemon(state)
+    head = args[0] if args else ""
+    if head == "status":
+        cmd_status(args[1:], state)
+    elif head == "account":
+        cmd_account(args[1:], state)
+    elif args[:2] == ["relay", "list"]:
+        if not state["loggedIn"]:
+            return
+        with open(RELAYS) as handle:
+            sys.stdout.write(handle.read())
+    elif head == "connect":
+        if state["loggedIn"]:
+            transition(state, "connecting", "connected")
+        else:
+            # The real daemon starts the tunnel anyway and blocks traffic.
+            state.update(tunnel="error", errorCause={"reason": "auth_failed", "details": "invalid_account"},
+                         blockFailure=None)
+            save_state(state)
+    elif head == "disconnect":
+        if state["tunnel"] != "disconnected":
+            transition(state, "disconnecting", "disconnected")
+    elif head == "reconnect":
+        if state["tunnel"] in ("connected", "connecting", "error"):
+            transition(state, "connecting", "connected")
+    elif args[:3] == ["relay", "set", "location"]:
+        settings = load_settings()
+        place = {"country": args[3]}
+        if len(args) > 4:
+            place["city"] = args[4]
+        settings["relay_settings"]["normal"]["location"] = {"only": {"location": place}}
+        save_settings(settings)
+        if state["tunnel"] == "connected":
+            transition(state, "connecting", "connected")
+    elif args[:3] == ["dns", "set", "default"]:
+        settings = load_settings()
+        flags = set(args[3:])
+        defaults = settings["tunnel_options"]["dns_options"]["default_options"]
+        for key in list(defaults.keys()):
+            if key.startswith("block_"):
+                defaults[key] = "--" + key.replace("_", "-") in flags
+        save_settings(settings)
+    else:
+        settings = load_settings()
+        if not set_flag(settings, args):
+            fail(f"stub: unsupported command {args}", 2)
+        save_settings(settings)
+
+
+if __name__ == "__main__":
+    main()
