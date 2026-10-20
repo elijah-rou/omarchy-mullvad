@@ -96,6 +96,10 @@ The panel structure, keyboard handling, and bar integration follow Omarchy's
 built-in Tailscale panel (MIT). The upstream copyright notice is kept in
 `LICENSE`.
 
+The icon draws the Mullvad mark from the [Simple Icons](https://simpleicons.org)
+path (CC0). The Mullvad name and logo are trademarks of Mullvad VPN AB, and this
+project is not affiliated with Mullvad.
+
 ## Development
 
 Run `./scripts/validate`. It validates the manifest, runs the model tests under
